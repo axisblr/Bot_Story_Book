@@ -28,8 +28,14 @@ from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ДЛЯ СТАТИСТИКИ ---
+
+DB_DIR = "/app/data" 
+os.makedirs(DB_DIR, exist_ok=True)
+DB_PATH = os.path.join(DB_DIR, "stats.db")
+
 def init_db():
-    conn = sqlite3.connect("stats.db")
+    # Заменяем "stats.db" на переменную DB_PATH
+    conn = sqlite3.connect(DB_PATH) 
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS monthly_stats (
@@ -572,7 +578,7 @@ async def finish_all(message: types.Message, state: FSMContext):
     current_month_year = datetime.now().strftime("%m-%Y")
 
     try:
-        conn = sqlite3.connect("stats.db")
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO monthly_stats (month_year, duration_sec, total_chars, had_bad_photo) VALUES (?, ?, ?, ?)",
@@ -647,7 +653,7 @@ async def send_monthly_stats():
         
     target_month_str = f"{prev_month:02d}-{prev_year}"
 
-    conn = sqlite3.connect("stats.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT duration_sec, total_chars, had_bad_photo FROM monthly_stats WHERE month_year = ?", (target_month_str,))
     records = cursor.fetchall()
