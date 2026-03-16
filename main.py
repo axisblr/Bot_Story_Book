@@ -1,0 +1,701 @@
+import os
+import asyncio
+import logging
+import re
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.filters import CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from dotenv import load_dotenv
+
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+
+# Библиотеки Google
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+import google.generativeai as genai
+import json
+
+import sqlite3
+import time
+from datetime import datetime
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ДЛЯ СТАТИСТИКИ ---
+def init_db():
+    conn = sqlite3.connect("stats.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS monthly_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            month_year TEXT,
+            duration_sec INTEGER,
+            total_chars INTEGER,
+            had_bad_photo INTEGER
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+load_dotenv()
+
+# --- КОНФИГУРАЦИЯ ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MAIN_FOLDER_ID = os.getenv("MAIN_FOLDER_ID")
+CLIENT_SECRET_FILE = 'credentials.json' 
+#SCOPES = ['https://www.googleapis.com/auth/drive']
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+admin_ids_str = os.getenv("ADMIN_IDS", "")
+ADMIN_ID = [int(admin_id.strip()) for admin_id in admin_ids_str.split(",") if admin_id.strip().isdigit()]
+
+def get_done_keyboard(text="✅ Готово, идем дальше"):
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=text)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+def get_skip_keyboard(yes_text="📸 Загрузить фото", no_text="➡️ Нет / Далее"):
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=no_text)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+# --- GOOGLE DRIVE AUTH ---
+CLIENT_SECRET_FILE = 'credentials.json'
+# Добавили права на таблицы
+SCOPES = [
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/spreadsheets'
+]
+
+def get_google_services():
+    creds = None
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+            
+    drive = build('drive', 'v3', credentials=creds)
+    sheets = build('sheets', 'v4', credentials=creds)
+    return drive, sheets
+
+drive_service, sheets_service = get_google_services()
+
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+dp = Dispatcher()
+logging.basicConfig(level=logging.INFO)
+
+# --- МАШИНА СОСТОЯНИЙ ---
+class OrderFlow(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_contact = State()
+    
+    waiting_for_main_chars_count = State()
+    waiting_for_total_chars_count = State()
+    waiting_for_main_chars_age = State()
+
+    waiting_for_relative_photo = State()
+    waiting_for_relative_caption = State()
+
+    waiting_for_pet_photo = State()
+    waiting_for_pet_caption = State()
+
+    waiting_for_toy_photo = State()
+    waiting_for_toy_caption = State()
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def create_drive_folder(folder_name, parent_id):
+    file_metadata = {
+        'name': folder_name,
+        'mimeType': 'application/vnd.google-apps.folder',
+        'parents': [parent_id]
+    }
+    file = drive_service.files().create(body=file_metadata, fields='id, webViewLink').execute()
+    return file.get('id'), file.get('webViewLink')
+
+
+
+def upload_file_to_drive(file_path, file_name, parent_id):
+    file_metadata = {'name': file_name, 'parents': [parent_id]}
+    media = MediaFileUpload(file_path, resumable=True)
+    file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+    return file.get('id')
+
+
+
+def clean_filename(text):
+    return re.sub(r'[\\/*?:"<>|]', "", text)
+
+def append_to_sheet(row_data):
+    try:
+        body = {'values': [row_data]}
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=os.getenv("SPREADSHEET_ID"),
+            range="A:E", # Записываем в первые 5 колонок
+            valueInputOption="USER_ENTERED",
+            body=body
+        ).execute()
+    except Exception as e:
+        logging.error(f"Ошибка записи в Google Таблицу: {e}")
+        
+        
+genai.configure(api_key=GEMINI_API_KEY)
+
+# --- ФУНКИЯ АНАЛИЗА ФОТО (Gemini) ---
+async def analyze_photo_quality(file_path: str) -> dict:
+    """Анализирует фото через Gemini и возвращает JSON с результатами проверки."""
+    try:
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        
+        sample_file = genai.upload_file(path=file_path)
+        
+        prompt = """
+        Проанализируй эту фотографию и верни ТОЛЬКО валидный JSON без маркдауна, строго по шаблону:
+        {
+            "is_naked_or_diaper": true/false,
+            "eyes_visible": true/false,
+            "face_count": integer
+        }
+        Правила:
+        - is_naked_or_diaper: true, если на фото есть ребенок без одежды или только в подгузнике/трусиках.
+        - eyes_visible: true, если хотя бы у одного человека на фото достаточно четко видно глаза (можно разобрать цвет).
+        - face_count: точное количество человеческих лиц на фото.
+        """
+        
+        response = await asyncio.to_thread(model.generate_content, [sample_file, prompt])
+        
+        genai.delete_file(sample_file.name)
+        
+        clean_json = response.text.strip().removeprefix('```json').removesuffix('```').strip()
+        result = json.loads(clean_json)
+        return result
+
+    except Exception as e:
+        logging.error(f"Ошибка анализа Gemini: {e}")
+        return {"is_naked_or_diaper": False, "eyes_visible": True, "face_count": 1}
+
+# ================= ХЕНДЛЕРЫ (КРАСИВЫЕ) =================
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext, command: CommandObject):
+    invite_code = os.getenv("INVITE_CODE")
+
+    if command.args != invite_code:
+        await message.answer("Извините, этот бот является приватным и работает только по специальным ссылкам-приглашениям. 🔒")
+        return
+
+    await state.clear()
+    
+    await state.update_data(start_time=time.time(), had_bad_photo=False)
+    
+    await message.answer(
+        "✨ <b>Добро пожаловать в мастерскую сказок!</b> ✨\n\n"
+        "Я помогу аккуратно собрать все фото для книги.\n"
+        "Давай начнем с оформления папки.\n\n"
+        "📝 <b>Напиши одним сообщением:</b>\n"
+        "<code>Твоё Имя Фамилию (Имя ребенка)</code>\n\n"
+        "<i>Например: Иванов Иван (Миша)</i>",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(OrderFlow.waiting_for_name)
+
+@dp.message(OrderFlow.waiting_for_name)
+async def process_name(message: types.Message, state: FSMContext):
+    await state.update_data(client_name_part=message.text)
+    await message.answer(
+        "👍 <b>Имя принято!</b>\n\n"
+        "Теперь укажи контакт для связи.\n"
+        "Напиши свой <b>Ник в Telegram</b> (через @) или <b>номер WhatsApp</b>.\n\n"
+        "<i>Я добавлю это в название папки, чтобы понимать, чей это заказ.</i>"
+    )
+    await state.set_state(OrderFlow.waiting_for_contact)
+
+@dp.message(OrderFlow.waiting_for_contact)
+async def process_contact(message: types.Message, state: FSMContext):
+    contact = message.text
+    data = await state.get_data()
+    name_part = data['client_name_part']
+
+    full_folder_name = f"{name_part} {contact}"
+
+    msg = await message.answer(f"Создаю папку '<b>{full_folder_name}</b>'... ⏳")
+
+    try:
+        folder_id, folder_link = await asyncio.to_thread(create_drive_folder, full_folder_name, MAIN_FOLDER_ID)
+        await state.update_data(current_folder_id=folder_id, folder_link=folder_link, full_name=full_folder_name)
+
+        # Сообщение 1: Папка готова
+        await msg.edit_text("📂 <b>Папка готова!</b>")
+
+        # Переходим к вопросам (ЭТАП 1)
+        await message.answer(
+            "📝 <b>Перед тем как мы перейдем к фото, ответьте, пожалуйста, на 3 коротких вопроса.</b>\n"
+            "Это очень поможет нам в создании вашей книги!\n\n"
+            "1️⃣ <b>Сколько главных героев будет в книге?</b>\n"
+            "<i>(Пожалуйста, напишите в чат только цифру)</i>"
+        )
+        await state.set_state(OrderFlow.waiting_for_main_chars_count)
+
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка создания папки: {e}")
+
+# --- НОВЫЕ ХЕНДЛЕРЫ ОПРОСА (ЭТАП 1) ---
+
+@dp.message(OrderFlow.waiting_for_main_chars_count)
+async def process_main_chars_count(message: types.Message, state: FSMContext):
+    # Сохраняем кол-во главных героев
+    await state.update_data(main_chars_count=message.text)
+    
+    await message.answer(
+        "Отлично! ✌️\n\n"
+        "2️⃣ <b>А сколько всего героев будет в книге?</b>\n"
+        "<i>(Включая главных героев. Напишите только цифру в чат)</i>"
+    )
+    await state.set_state(OrderFlow.waiting_for_total_chars_count)
+
+
+@dp.message(OrderFlow.waiting_for_total_chars_count)
+async def process_total_chars_count(message: types.Message, state: FSMContext):
+    # Сохраняем общее кол-во героев
+    await state.update_data(total_chars_count=message.text)
+    
+    await message.answer(
+        "Принято! И последний вопрос ⏳\n\n"
+        "3️⃣ <b>Какой возраст у главного героя (или героев)?</b>\n"
+        "<i>(Напишите только цифру в чат)</i>"
+    )
+    await state.set_state(OrderFlow.waiting_for_main_chars_age)
+
+
+@dp.message(OrderFlow.waiting_for_main_chars_age)
+async def process_main_chars_age(message: types.Message, state: FSMContext):
+    # Сохраняем возраст
+    await state.update_data(main_chars_age=message.text)
+
+    # Выдаем ТВОЮ ОБНОВЛЕННУЮ ПАМЯТКУ
+    await message.answer(
+        "📸 <b>ВАЖНО: Как выбрать фото?</b>\n\n"
+        "Чтобы мы смогли описать внешность максимально точно, пожалуйста, следуйте этим советам:\n\n"
+        "1️⃣ <b>Четкость и детали</b>\n"
+        "На фото должны быть <b>хорошо видны цвет глаз и волос</b>. Избегайте размытых и темных кадров.\n\n"
+        "2️⃣ <b>Крупный план</b>\n"
+        "Идеально — портрет или фото по пояс. Ha фото, где человек стоит далеко (например, где-то за столом), сложно разобрать черты лица.\n\n"
+        "3️⃣ <b>Количество</b>\n"
+        "Можно присылать <b>1-2 фото</b> одного человека c разных ракурсов.\n<b>Однако очень важно понимать один момент:</b> герой будет одинаковым на всех иллюстрациях (прическа, одежда, цвет волос и тд). Поэтому только вам решать, в каком наряде вы бы хотели видеть вашего ребенка и родных на иллюстрациях. Присылать 1 или 2 фото одного человека более чем достаточно😊\nИ тем самым вы сами выбираете облик героя книги, который больше всего хотели бы именно <b>ВЫ</b>\n\n"
+        "👇 <b>Теперь можно начинать! Жду первое фото.</b>",
+    )
+
+    # Кнопку "Все загружены" показываем сразу
+    await message.answer("После каждого фото я спрошу имя. Когда загрузите всех, нажмите кнопку:", reply_markup=get_done_keyboard("✅ Все люди загружены"))
+
+    # Переводим бота в режим ожидания первого фото
+    await state.set_state(OrderFlow.waiting_for_relative_photo)
+
+# --- БЛОК РОДСТВЕННИКОВ ---
+
+@dp.message(OrderFlow.waiting_for_relative_photo, F.photo)
+async def relative_photo(message: types.Message, state: FSMContext):
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    temp_name = f"temp_{photo.file_id[:10]}.jpg"
+    await bot.download_file(file.file_path, temp_name)
+    
+    # Отправляем сообщение "думаю", так как анализ займет пару секунд
+    msg_thinking = await message.reply("👀 <i>Внимательно смотрю на фотографию...</i>")
+    
+    # Запускаем проверку через Gemini
+    check_result = await analyze_photo_quality(temp_name)
+    
+    # Удаляем сообщение "думаю"
+    await msg_thinking.delete()
+
+    # Проверяем условия и выдаем мягкие отказы
+    if check_result.get("is_naked_or_diaper"):
+        os.remove(temp_name)
+        await state.update_data(had_bad_photo=True)
+        await message.answer(
+            "Ой, какая чудесная фотография! 😍 Но для создания иллюстраций нам нужны фото малышей в одежде (хотя бы в футболочке). "
+            "Нейросети очень строги к детским фото без одежды. Пожалуйста, пришлите другой кадр, где малыш одет 🙏"
+        )
+        return # Остаемся в текущем состоянии, ждем другое фото
+
+    if not check_result.get("eyes_visible"):
+        os.remove(temp_name)
+        await state.update_data(had_bad_photo=True)
+        await message.answer(
+            "Фотография замечательная! ✨ Но, к сожалению, на ней не очень хорошо видно глазки, "
+            "а нам очень важно точно передать их цвет в книге. Пожалуйста, выберите фото, где лицо и глаза видно более четко 👁️"
+        )
+        return
+
+    if check_result.get("face_count", 0) > 2:
+        os.remove(temp_name)
+        await state.update_data(had_bad_photo=True)
+        await message.answer(
+            "Какое теплое семейное фото! 🥰 Однако нашей системе сложно сфокусироваться, когда на снимке больше двух человек. "
+            "Если вам нужен именно этот кадр, пожалуйста, немного обрежьте его, оставив 1-2 нужных героев, или пришлите другую фотографию 📸"
+        )
+        return
+
+    # Если все проверки пройдены:
+    await state.update_data(temp_photo_path=temp_name)
+    await message.reply(
+        "📸 <b>Фото прошло проверку и принято!</b>\n"
+        "Напиши: <b>Кто это?</b> (например: Мама Оля, Дедушка Валера, Тетя Полина и т.д.)", 
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(OrderFlow.waiting_for_relative_caption)
+
+
+
+@dp.message(OrderFlow.waiting_for_relative_caption)
+async def relative_caption(message: types.Message, state: FSMContext):
+    name = clean_filename(message.text)
+    filename = f"{name}.jpg"
+
+    data = await state.get_data()
+    await message.answer(f"Загружаю '<b>{filename}</b>'... ⏳")
+
+    try:
+        await asyncio.to_thread(upload_file_to_drive, data['temp_photo_path'], filename, data['current_folder_id'])
+        if os.path.exists(data['temp_photo_path']): os.remove(data['temp_photo_path'])  # noqa: E701
+
+        await message.answer(
+            f"✅ <b>{name}</b> сохранен!\n"
+            "Присылай следующее фото или жми кнопку.",
+            reply_markup=get_done_keyboard("✅ Все люди загружены")
+        )
+        await state.set_state(OrderFlow.waiting_for_relative_photo)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+
+
+@dp.message(OrderFlow.waiting_for_relative_photo, F.text == "✅ Все люди загружены")
+async def finish_relatives(message: types.Message, state: FSMContext):
+    await message.answer(
+        "Отлично, с людьми закончили! 👨‍👩‍👧‍👦\n\n"
+        "4️⃣ <b>Есть ли у вас домашние животные?</b> 🐶🐱\n"
+        "Если <b>ЕСТЬ</b>: Просто пришли фото питомца.\n"
+        "Если <b>НЕТ</b>: Нажми кнопку ниже.",
+        reply_markup=get_skip_keyboard("📸 Фото питомца", "➡️ Нет животных / Готово")
+    )
+    await state.set_state(OrderFlow.waiting_for_pet_photo)
+
+# --- БЛОК ПИТОМЦЕВ ---
+
+@dp.message(OrderFlow.waiting_for_pet_photo, F.photo)
+async def pet_photo(message: types.Message, state: FSMContext):
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    temp_name = f"temp_pet_{photo.file_id[:10]}.jpg"
+    await bot.download_file(file.file_path, temp_name)
+    await state.update_data(temp_photo_path=temp_name)
+
+    await message.reply("🐾 <b>Милаха!</b> Как зовут? (и кто это?)", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(OrderFlow.waiting_for_pet_caption)
+
+@dp.message(OrderFlow.waiting_for_pet_caption)
+async def pet_caption(message: types.Message, state: FSMContext):
+    name = clean_filename(message.text)
+    filename = f"Питомец {name}.jpg"
+
+    data = await state.get_data()
+    await message.answer("Сохраняю питомца... ⏳")
+
+    try:
+        await asyncio.to_thread(upload_file_to_drive, data['temp_photo_path'], filename, data['current_folder_id'])
+        if os.path.exists(data['temp_photo_path']): os.remove(data['temp_photo_path'])  # noqa: E701
+
+        await message.answer(
+            f"✅ <b>{name}</b> в домике!\n"
+            "Есть еще животные? Присылай фото или жми кнопку.",
+            reply_markup=get_skip_keyboard(no_text="➡️ Готово, идем к игрушкам")
+        )
+        await state.set_state(OrderFlow.waiting_for_pet_photo)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(OrderFlow.waiting_for_pet_photo)
+async def finish_pets(message: types.Message, state: FSMContext):
+    await message.answer(
+        "Принято! 🐾\n\n"
+        "5️⃣ <b>Последний вопрос: Любимая игрушка</b> 🧸\n"
+        "Если <b>ЕСТЬ</b>: Пришли её фото.\n"
+        "Если <b>НЕТ</b>: Нажми кнопку ниже.",
+        reply_markup=get_skip_keyboard(no_text="➡️ Нет игрушки / Закончить")
+    )
+    await state.set_state(OrderFlow.waiting_for_toy_photo)
+
+# --- БЛОК ИГРУШКИ ---
+
+@dp.message(OrderFlow.waiting_for_toy_photo, F.photo)
+async def toy_photo(message: types.Message, state: FSMContext):
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    temp_name = f"temp_toy_{photo.file_id[:10]}.jpg"
+    await bot.download_file(file.file_path, temp_name)
+    await state.update_data(temp_photo_path=temp_name)
+
+    await message.reply("🧸 <b>Вижу!</b> Как называется игрушка?", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(OrderFlow.waiting_for_toy_caption)
+
+@dp.message(OrderFlow.waiting_for_toy_caption)
+async def toy_caption(message: types.Message, state: FSMContext):
+    name = clean_filename(message.text)
+    filename = f"Игрушка {name}.jpg"
+
+    data = await state.get_data()
+    await message.answer("Загружаю игрушку... ⏳")
+
+    try:
+        await asyncio.to_thread(upload_file_to_drive, data['temp_photo_path'], filename, data['current_folder_id'])
+        if os.path.exists(data['temp_photo_path']): os.remove(data['temp_photo_path'])  # noqa: E701
+        await finish_all(message, state)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(OrderFlow.waiting_for_toy_photo)
+async def skip_toy_and_finish(message: types.Message, state: FSMContext):
+    await finish_all(message, state)
+
+
+
+# --- АДМИНСКИЕ КОМАНДЫ ---
+
+async def finish_all(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    link = data.get('folder_link', 'нет ссылки')
+    full_name_str = data.get('full_name', 'Клиент') # Например: "Иванов Иван (Миша) @nik"
+    
+    # 1. Извлекаем переменные (защита от неверного ввода - если не цифра, ставим дефолт)
+    try:
+        age = int(data.get('main_chars_age', 0))
+        main_count = int(data.get('main_chars_count', 1))
+        total_count = int(data.get('total_chars_count', 1))
+    except ValueError:
+        age, main_count, total_count = 0, 1, 1
+
+    # 2. Парсим Имя заказчика и Имя ребенка
+    # Ищем шаблон "Имя (Ребенок) Контакт"
+    match = re.search(r"^(.*?)\s*\((.*?)\)\s*(.*)$", full_name_str)
+    if match:
+        customer_name = f"{match.group(1).strip()} {match.group(3).strip()}" # Иванов Иван @nik
+        child_name = match.group(2).strip() # Миша
+    else:
+        customer_name = full_name_str
+        child_name = "Не указано"
+
+    # 3. МАТЕМАТИКА: Сложность заказа
+    complexity = 0
+    complexity += 2 if age <= 3 else 3
+    complexity += 1 if main_count == 1 else 3
+    
+    if total_count <= 7:
+        complexity += 2
+    elif 8 <= total_count <= 12:
+        complexity += 3
+    else:
+        complexity += 4
+        
+    complexity_str = "⭐" * complexity
+
+    # 4. МАТЕМАТИКА: Стоимость книги
+    base_cost = 60 if total_count > 7 else 50
+    
+    if main_count > 1:
+        cost = base_cost + ((main_count - 1) * (base_cost * 0.5))
+    else:
+        cost = base_cost
+        
+    if total_count > 12:
+        cost += 20
+        
+    cost_str = f"{int(cost)} BYN"
+
+    # 5. ОТПРАВЛЯЕМ ДАННЫЕ В ТАБЛИЦУ
+    row_data = [customer_name, child_name, total_count, complexity_str, cost_str]
+    await asyncio.to_thread(append_to_sheet, row_data)
+
+    # 6. ОТПРАВЛЯЕМ СООБЩЕНИЕ КЛИЕНТУ
+    await message.answer(
+        "🎉 <b>Спасибо! Анкета принята.</b>\n\n"
+        "Мы получили все фото и уже начинаем работу над вашей книгой! ✨\n",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+    # 7. ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ АДМИНАМ
+    for admin_id in ADMIN_ID:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"🔔 <b>НОВЫЙ ЗАКАЗ!</b>\n\n"
+                    f"👤 Заказчик: <b>{customer_name}</b>\n"
+                    f"👶 Ребенок: <b>{child_name}</b>\n"
+                    f"👥 Всего героев: <b>{total_count}</b>\n"
+                    f"📊 Сложность: <b>{complexity_str}</b>\n"
+                    f"💰 Расчетная сумма: <b>{cost_str}</b>\n\n"
+                    f"📂 Папка: <a href='{link}'>Открыть на Диске</a>"
+                ),
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            logging.error(f"Не удалось отправить админу {admin_id}: {e}")
+            
+    # --- СБОР ДОЛГОСРОЧНОЙ СТАТИСТИКИ ---
+    start_time = data.get('start_time', time.time())
+    duration_sec = int(time.time() - start_time)
+    had_bad_photo = 1 if data.get('had_bad_photo') else 0
+    
+    # Получаем текущий месяц в формате "MM-YYYY" (например, "03-2026")
+    current_month_year = datetime.now().strftime("%m-%Y")
+
+    try:
+        conn = sqlite3.connect("stats.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO monthly_stats (month_year, duration_sec, total_chars, had_bad_photo) VALUES (?, ?, ?, ?)",
+            (current_month_year, duration_sec, total_count, had_bad_photo)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Ошибка записи статистики в БД: {e}")
+
+    await state.clear()
+
+
+# --- АДМИНСКАЯ КОМАНДА: РУЧНОЕ СОЗДАНИЕ ЗАКАЗА (ДЛЯ WHATSAPP) ---
+@dp.message(Command("manual"))
+async def cmd_manual(message: types.Message, command: CommandObject, state: FSMContext):
+    # 1. Проверка на админа
+    if message.from_user.id not in (ADMIN_ID if isinstance(ADMIN_ID, list) else [ADMIN_ID]):
+        return
+
+    # 2. Проверка аргументов
+    if not command.args:
+        await message.answer(
+            "⚠️ <b>Ошибка ввода.</b>\n"
+            "Используй: <code>/manual Имя Фамилия (Инфо)</code>\n"
+            "Пример: <code>/manual Иванов Иван (из WhatsApp)</code>"
+        )
+        return
+
+    folder_name = command.args.strip()
+
+    # 3. Сразу создаем папку
+    msg = await message.answer(f"🛠 <b>Ручной режим:</b> Создаю папку '<b>{folder_name}</b>'... ⏳")
+
+    try:
+        # Создаем папку на Диске
+        folder_id, folder_link = await asyncio.to_thread(create_drive_folder, folder_name, MAIN_FOLDER_ID)
+
+        # Сохраняем данные в состояние, как будто клиент сам все прошел
+        await state.update_data(
+            current_folder_id=folder_id,
+            folder_link=folder_link,
+            full_name=folder_name
+        )
+
+        await msg.edit_text(
+            f"📂 <b>Папка готова!</b>\n"
+            f"🔗 <a href='{folder_link}'>Ссылка</a>\n\n"
+            "👇 <b>Теперь пересылай фото от менеджера.</b>\n"
+            "Пересылай ПО ОДНОМУ, подписывай как обычно."
+        )
+
+        # Сразу ставим состояние ожидания фото родственника
+        await state.set_state(OrderFlow.waiting_for_relative_photo)
+
+        # Показываем кнопку завершения
+        await message.answer("Погнали!", reply_markup=get_done_keyboard("✅ Все люди загружены"))
+
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка: {e}")
+    
+    
+async def send_monthly_stats():
+    # Вычисляем прошлый месяц
+    now = datetime.now()
+    if now.month == 1:
+        prev_month = 12
+        prev_year = now.year - 1
+    else:
+        prev_month = now.month - 1
+        prev_year = now.year
+        
+    target_month_str = f"{prev_month:02d}-{prev_year}"
+
+    conn = sqlite3.connect("stats.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT duration_sec, total_chars, had_bad_photo FROM monthly_stats WHERE month_year = ?", (target_month_str,))
+    records = cursor.fetchall()
+    conn.close()
+
+    if not records:
+        return # Если заказов не было, ничего не отправляем
+
+    total_orders = len(records)
+    sum_duration = sum(row[0] for row in records)
+    sum_chars = sum(row[1] for row in records)
+    sum_bad_photos = sum(row[2] for row in records)
+
+    # Математика
+    avg_duration_sec = sum_duration / total_orders
+    avg_mins = int(avg_duration_sec // 60)
+    
+    # Правильное математическое округление до целого
+    avg_chars = int(sum_chars / total_orders + 0.5) 
+    
+    # Процент плохих фото
+    bad_photo_percent = int((sum_bad_photos / total_orders) * 100)
+
+    # Отправляем админам
+    for admin_id in ADMIN_ID:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"📈 <b>СТАТИСТИКА ЗА ПРОШЛЫЙ МЕСЯЦ</b> ({target_month_str})\n\n"
+                    f"📦 Всего заказов: <b>{total_orders}</b>\n"
+                    f"⏱ Среднее время заполнения: <b>~{avg_mins} мин.</b>\n"
+                    f"👥 Среднее кол-во героев: <b>{avg_chars}</b>\n"
+                    f"⚠️ Доля клиентов с плохими фото: <b>{bad_photo_percent}%</b>\n\n"
+                    f"<i>Продолжаем работать! 🚀</i>"
+                )
+            )
+        except Exception as e:
+            logging.error(f"Ошибка отправки статистики: {e}")
+
+async def main():
+    # Настраиваем планировщик
+    scheduler = AsyncIOScheduler()
+    # Запускаем 2-го числа каждого месяца в 12:00 дня
+    scheduler.add_job(send_monthly_stats, 'cron', day=2, hour=12, minute=0)
+    scheduler.start()
+
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
