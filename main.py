@@ -203,15 +203,11 @@ async def analyze_photo_quality(file_path: str) -> dict:
 # ================= ХЕНДЛЕРЫ (КРАСИВЫЕ) =================
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext, command: CommandObject):
-    invite_code = os.getenv("INVITE_CODE")
-
-    if command.args != invite_code:
-        await message.answer("Извините, этот бот является приватным и работает только по специальным ссылкам-приглашениям. 🔒")
-        return
-
+async def cmd_start(message: types.Message, state: FSMContext):
+    # Код проверки invite_code полностью удален
     await state.clear()
     
+    # Засекаем время старта для будущей статистики
     await state.update_data(start_time=time.time(), had_bad_photo=False)
     
     await message.answer(
