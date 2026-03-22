@@ -37,6 +37,7 @@ def init_db():
     # Заменяем "stats.db" на переменную DB_PATH
     conn = sqlite3.connect(DB_PATH) 
     cursor = conn.cursor()
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS monthly_stats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,8 +45,14 @@ def init_db():
             duration_sec INTEGER,
             total_chars INTEGER,
             had_bad_photo INTEGER
+            cost INTEGER
         )
     ''')
+    
+    try:
+        cursor.execute("ALTER TABLE monthly_stats ADD COLUMN cost INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -113,12 +120,14 @@ logging.basicConfig(level=logging.INFO)
 
 # --- МАШИНА СОСТОЯНИЙ ---
 class OrderFlow(StatesGroup):
+    waiting_for_bot_knowledge = State()
     waiting_for_name = State()
     waiting_for_contact = State()
     
     waiting_for_main_chars_count = State()
     waiting_for_total_chars_count = State()
     waiting_for_main_chars_age = State()
+    waiting_for_style = State()
 
     waiting_for_relative_photo = State()
     waiting_for_relative_caption = State()
@@ -139,6 +148,23 @@ def create_drive_folder(folder_name, parent_id):
     file = drive_service.files().create(body=file_metadata, fields='id, webViewLink').execute()
     return file.get('id'), file.get('webViewLink')
 
+def get_onboarding_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Да, я умею пользоваться ботами")],
+            [KeyboardButton(text="🤔 Нет, расскажите, как это работает")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+def get_start_after_help_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🚀 Всё понятно, давайте начинать!")]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
 
 
 def upload_file_to_drive(file_path, file_name, parent_id):
@@ -157,7 +183,7 @@ def append_to_sheet(row_data):
         body = {'values': [row_data]}
         sheets_service.spreadsheets().values().append(
             spreadsheetId=os.getenv("SPREADSHEET_ID"),
-            range="A:E", # Записываем в первые 5 колонок
+            range="A:F", 
             valueInputOption="USER_ENTERED",
             body=body
         ).execute()
@@ -176,16 +202,20 @@ async def analyze_photo_quality(file_path: str) -> dict:
         sample_file = genai.upload_file(path=file_path)
         
         prompt = """
-        Проанализируй эту фотографию и верни ТОЛЬКО валидный JSON без маркдауна, строго по шаблону:
+        You are a strict photo moderator for an automated system.
+        Analyze the attached photo and return the result STRICTLY as a JSON object without any markdown formatting.
+
+        Strict verification rules:
+        1. NUMBER OF PEOPLE: Carefully count all the people in the frame (including those in the background). 
+        2. CLOTHING: Is the person wearing everyday clothing? If a child is wearing ONLY a diaper, underwear, a swimsuit, or if a person is naked/topless, this is a violation (set to true).
+        3. COMPOSITION: Is the full face visible? If it's an extreme close-up (e.g., only one eye or nose taking up the whole frame) or the face is heavily cropped by the edge of the photo, this is a violation (set to false). We need a standard portrait.
+
+        Return the JSON strictly following this template:
         {
-            "is_naked_or_diaper": true/false,
-            "eyes_visible": true/false,
-            "face_count": integer
+        "face_count": <integer, number of people in the photo>,
+        is_naked_or_diaper": <true if wearing only a diaper/underwear/swimsuit or naked, otherwise false>,
+        "is_full_face_visible": <true if the face is normally visible, false if it's an extreme macro shot or heavily cropped>
         }
-        Правила:
-        - is_naked_or_diaper: true, если на фото есть ребенок без одежды или только в подгузнике/трусиках.
-        - eyes_visible: true, если хотя бы у одного человека на фото достаточно четко видно глаза (можно разобрать цвет).
-        - face_count: точное количество человеческих лиц на фото.
         """
         
         response = await asyncio.to_thread(model.generate_content, [sample_file, prompt])
@@ -200,11 +230,10 @@ async def analyze_photo_quality(file_path: str) -> dict:
         logging.error(f"Ошибка анализа Gemini: {e}")
         return {"is_naked_or_diaper": False, "eyes_visible": True, "face_count": 1}
 
-# ================= ХЕНДЛЕРЫ (КРАСИВЫЕ) =================
+# ================= ХЕНДЛЕРЫ =================
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    # Код проверки invite_code полностью удален
     await state.clear()
     
     # Засекаем время старта для будущей статистики
@@ -212,11 +241,67 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     await message.answer(
         "✨ <b>Добро пожаловать в мастерскую сказок!</b> ✨\n\n"
-        "Я помогу аккуратно собрать все фото для книги.\n"
-        "Давай начнем с оформления папки.\n\n"
-        "📝 <b>Напиши одним сообщением:</b>\n"
-        "<code>Твоё Имя Фамилию (Имя ребенка)</code>\n\n"
-        "<i>Например: Иванов Иван (Миша)</i>",
+        "Я — ваш автоматический помощник. Моя задача — аккуратно собрать все фотографии для вашей будущей книги и передать их нашим художникам.\n\n"
+        "Скажите, вы уже пользовались Telegram-ботами раньше?",
+        reply_markup=get_onboarding_keyboard()
+    )
+    await state.set_state(OrderFlow.waiting_for_bot_knowledge)
+    
+    @dp.message(Command("restart"))
+    async def cmd_restart(message: types.Message, state: FSMContext):
+        data = await state.get_data()
+    
+    # Проверяем, дошел ли человек вообще до создания папки
+        if 'current_folder_id' not in data:
+            await message.answer(
+                "⚠️ Вы еще не начали оформление заказа или папка не была создана.\n"
+                "Пожалуйста, нажмите /start, чтобы начать с самого начала."
+            )
+            return
+
+        # Если папка есть, просто откатываем состояние до приема первого фото родственников
+        await state.set_state(OrderFlow.waiting_for_relative_photo)
+        
+        await message.answer(
+            "🙌 <b>Ничего страшного, с каждым могло случиться! Все абсолютно под контролем.</b>\n\n"
+            "Ваша персональная папка никуда не пропала, и все ответы на вопросы сохранены. Мы просто сбросили процесс загрузки.\n\n"
+            "Начинайте загружать фото заново (строго по одному!). Если нужно освежить в памяти правила выбора фото — просто пролистайте чат немного вверх.\n\n"
+            "👇 <b>Жду первое фото!</b>",
+            reply_markup=ReplyKeyboardRemove() # На всякий случай убираем старые кнопки
+        )
+        
+        # Снова показываем кнопку "Все люди загружены", чтобы она была под рукой
+        await message.answer(
+            "После каждого фото я спрошу имя. Когда загрузите всех, нажмите кнопку:", 
+            reply_markup=get_done_keyboard("✅ Все люди загружены")
+        )
+
+
+@dp.message(OrderFlow.waiting_for_bot_knowledge, F.text == "🤔 Нет, расскажите, как это работает")
+async def explain_bot_logic(message: types.Message):
+    # Если человек не знает, что такое бот, объясняем очень просто
+    await message.answer(
+        "💡 <b>Не волнуйтесь, это очень просто!</b>\n\n"
+        "Представьте, что я — строгий, но вежливый библиотекарь 🤓\n"
+        "Я не умею поддерживать светскую беседу или отвечать на сложные вопросы (я не искусственный интеллект, как ChatGPT).\n\n"
+        "<b>Моя работа строится строго по шагам:</b>\n"
+        "1️⃣ Я задаю вам конкретный вопрос (например, «Как вас зовут?»).\n"
+        "2️⃣ Вы пишете ответ в чат и отправляете его мне. Примерно так же, как вы бы писали любому другому человеку в Telegram\n"
+        "3️⃣ Я сохраняю ответ и задаю следующий вопрос или прошу прислать фото.\n\n"
+        "⚠️ <i>Самое главное: отвечайте строго на тот вопрос, который я задал, и присылайте фото только тогда, когда я об этом попрошу.</i>\n\n"
+        "Готовы попробовать? Жмите кнопку ниже!",
+        reply_markup=get_start_after_help_keyboard()
+    )
+    
+
+
+@dp.message(OrderFlow.waiting_for_bot_knowledge)
+async def start_questionnaire(message: types.Message, state: FSMContext):
+    await message.answer(
+        "Отлично! Тогда давайте приступим к оформлению вашей персональной папки.\n\n"
+        "📝 <b>Напишите одним сообщением:</b>\n"
+        "<code>Ваше Имя Фамилию (Имя ребенка)</code>\n\n"
+        "<i>Например: Иванова Анна (Миша)</i>",
         reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(OrderFlow.waiting_for_name)
@@ -246,12 +331,10 @@ async def process_contact(message: types.Message, state: FSMContext):
         folder_id, folder_link = await asyncio.to_thread(create_drive_folder, full_folder_name, MAIN_FOLDER_ID)
         await state.update_data(current_folder_id=folder_id, folder_link=folder_link, full_name=full_folder_name)
 
-        # Сообщение 1: Папка готова
         await msg.edit_text("📂 <b>Папка готова!</b>")
 
-        # Переходим к вопросам (ЭТАП 1)
         await message.answer(
-            "📝 <b>Перед тем как мы перейдем к фото, ответьте, пожалуйста, на 3 коротких вопроса.</b>\n"
+            "📝 <b>Перед тем как мы перейдем к фото, ответьте, пожалуйста, на 4 коротких вопроса.</b>\n"
             "Это очень поможет нам в создании вашей книги!\n\n"
             "1️⃣ <b>Сколько главных героев будет в книге?</b>\n"
             "<i>(Пожалуйста, напишите в чат только цифру)</i>"
@@ -261,11 +344,13 @@ async def process_contact(message: types.Message, state: FSMContext):
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка создания папки: {e}")
 
-# --- НОВЫЕ ХЕНДЛЕРЫ ОПРОСА (ЭТАП 1) ---
+# --- НОВЫЕ ХЕНДЛЕРЫ ОПРОСА ---
 
-@dp.message(OrderFlow.waiting_for_main_chars_count)
+@dp.message(OrderFlow.waiting_for_main_chars_count, F.text)
 async def process_main_chars_count(message: types.Message, state: FSMContext):
-    # Сохраняем кол-во главных героев
+    if not message.text.isdigit():
+        await message.answer("⚠️ Пожалуйста, напишите **только цифру** (например: 1, 2 или 3).")
+        return
     await state.update_data(main_chars_count=message.text)
     
     await message.answer(
@@ -276,9 +361,11 @@ async def process_main_chars_count(message: types.Message, state: FSMContext):
     await state.set_state(OrderFlow.waiting_for_total_chars_count)
 
 
-@dp.message(OrderFlow.waiting_for_total_chars_count)
+@dp.message(OrderFlow.waiting_for_total_chars_count, F.text)
 async def process_total_chars_count(message: types.Message, state: FSMContext):
-    # Сохраняем общее кол-во героев
+    if not message.text.isdigit():
+        await message.answer("⚠️ Пожалуйста, напишите **только цифру**.")
+        return
     await state.update_data(total_chars_count=message.text)
     
     await message.answer(
@@ -289,13 +376,32 @@ async def process_total_chars_count(message: types.Message, state: FSMContext):
     await state.set_state(OrderFlow.waiting_for_main_chars_age)
 
 
-@dp.message(OrderFlow.waiting_for_main_chars_age)
+@dp.message(OrderFlow.waiting_for_main_chars_age, F.text)
 async def process_main_chars_age(message: types.Message, state: FSMContext):
-    # Сохраняем возраст
+    if not message.text.isdigit():
+        await message.answer("⚠️ Пожалуйста, напишите **только цифру**.")
+        return
     await state.update_data(main_chars_age=message.text)
-
-    # Выдаем ТВОЮ ОБНОВЛЕННУЮ ПАМЯТКУ
+    
     await message.answer(
+        "🎨 <b>И последний вопрос перед загрузкой фото!</b>\n\n"
+        "Вы уже ознакомились с нашим PDF-файлом, где представлены стили иллюстраций.\n"
+        "Напишите, пожалуйста, какой стиль для вашей книги вы выбрали?\n"
+        "<i>(Например: Дисней, Реализм или любой другой из файла)</i>"
+    )
+    await state.set_state(OrderFlow.waiting_for_style)
+
+
+# ВАЖНО: Эта функция идет строго ПОСЛЕ предыдущей, без отступов слева!
+@dp.message(OrderFlow.waiting_for_style)
+async def process_book_style(message: types.Message, state: FSMContext):
+    # Сохраняем выбранный стиль
+    await state.update_data(book_style=message.text)
+    
+    # Выдаем ТВОЮ ОБНОВЛЕННУЮ ПАМЯТКУ (один раз)
+    await message.answer(
+        "Отлично! Все вводные данные собраны. 📝\n\n"
+        "Теперь переходим к самому важному — загрузке фотографий...\n\n"
         "📸 <b>ВАЖНО: Как выбрать фото?</b>\n\n"
         "Чтобы мы смогли описать внешность максимально точно, пожалуйста, следуйте этим советам:\n\n"
         "1️⃣ <b>Четкость и детали</b>\n"
@@ -304,19 +410,27 @@ async def process_main_chars_age(message: types.Message, state: FSMContext):
         "Идеально — портрет или фото по пояс. Ha фото, где человек стоит далеко (например, где-то за столом), сложно разобрать черты лица.\n\n"
         "3️⃣ <b>Количество</b>\n"
         "Можно присылать <b>1-2 фото</b> одного человека c разных ракурсов.\n<b>Однако очень важно понимать один момент:</b> герой будет одинаковым на всех иллюстрациях (прическа, одежда, цвет волос и тд). Поэтому только вам решать, в каком наряде вы бы хотели видеть вашего ребенка и родных на иллюстрациях. Присылать 1 или 2 фото одного человека более чем достаточно😊\nИ тем самым вы сами выбираете облик героя книги, который больше всего хотели бы именно <b>ВЫ</b>\n\n"
-        "👇 <b>Теперь можно начинать! Жду первое фото.</b>",
+        "🔄 <b>АВАРИЙНАЯ КНОПКА:</b>\n"
+        "Хоть я и стараюсь не давать вам совершить ошибку, ситуации бывают разные. Если вдруг что-то пошло не так, бот завис или вы запутались — просто отправьте мне команду /restart или выберите её в меню слева внизу.\n\n"
+        "👇 <b>Теперь можно начинать! Жду первое фото.</b>"
     )
 
-    # Кнопку "Все загружены" показываем сразу
-    await message.answer("После каждого фото я спрошу имя. Когда загрузите всех, нажмите кнопку:", reply_markup=get_done_keyboard("✅ Все люди загружены"))
-
-    # Переводим бота в режим ожидания первого фото
+    # Показываем кнопку "Готово"
+    await message.answer(
+        "После каждого фото я спрошу имя. Когда загрузите всех, нажмите кнопку:", 
+        reply_markup=get_done_keyboard("✅ Все люди загружены")
+    )
+    
+    # Переводим бота в режим ожидания фотографий
     await state.set_state(OrderFlow.waiting_for_relative_photo)
 
 # --- БЛОК РОДСТВЕННИКОВ ---
 
 @dp.message(OrderFlow.waiting_for_relative_photo, F.photo)
 async def relative_photo(message: types.Message, state: FSMContext):
+    if message.media_group_id:
+        await message.answer("❌ <b>Пожалуйста, присылайте строго по ОДНОМУ фото за раз!</b>\nЯ не умею обрабатывать альбомы. Выберите одно лучшее фото и отправьте его.")
+        return
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     temp_name = f"temp_{photo.file_id[:10]}.jpg"
@@ -332,30 +446,32 @@ async def relative_photo(message: types.Message, state: FSMContext):
     await msg_thinking.delete()
 
     # Проверяем условия и выдаем мягкие отказы
-    if check_result.get("is_naked_or_diaper"):
-        os.remove(temp_name)
-        await state.update_data(had_bad_photo=True)
+    if check_result.get("face_count", 0) > 1:
+        os.remove(temp_name) # Удаляем фотку
+        await state.update_data(had_bad_photo=True) # Статистика плохих фото
         await message.answer(
-            "Ой, какая чудесная фотография! 😍 Но для создания иллюстраций нам нужны фото малышей в одежде (хотя бы в футболочке). "
-            "Нейросети очень строги к детским фото без одежды. Пожалуйста, пришлите другой кадр, где малыш одет 🙏"
-        )
-        return # Остаемся в текущем состоянии, ждем другое фото
-
-    if not check_result.get("eyes_visible"):
-        os.remove(temp_name)
-        await state.update_data(had_bad_photo=True)
-        await message.answer(
-            "Фотография замечательная! ✨ Но, к сожалению, на ней не очень хорошо видно глазки, "
-            "а нам очень важно точно передать их цвет в книге. Пожалуйста, выберите фото, где лицо и глаза видно более четко 👁️"
+            "❌ <b>Ой, на фото больше одного человека!</b>\n\n"
+            "Нейросеть запутается, кого именно из вас рисовать. Пожалуйста, пришлите фото, где ваш герой находится в кадре один."
         )
         return
 
-    if check_result.get("face_count", 0) > 2:
+    # 2. Проверка на памперсы и голые торсы
+    if check_result.get("is_naked_or_diaper") is True:
         os.remove(temp_name)
         await state.update_data(had_bad_photo=True)
         await message.answer(
-            "Какое теплое семейное фото! 🥰 Однако нашей системе сложно сфокусироваться, когда на снимке больше двух человек. "
-            "Если вам нужен именно этот кадр, пожалуйста, немного обрежьте его, оставив 1-2 нужных героев, или пришлите другую фотографию 📸"
+            "❌ <b>Фото не подходит из-за одежды (или её отсутствия).</b>\n\n"
+            "Наши фильтры безопасности строго блокируют фото малышей в подгузниках/памперсах, купальниках или без одежды. Пожалуйста, пришлите фото в обычной повседневной одежде."
+        )
+        return
+
+    # 3. Проверка на "только глаза" и обрезанные лица
+    if check_result.get("is_full_face_visible") is False:
+        os.remove(temp_name)
+        await state.update_data(had_bad_photo=True)
+        await message.answer(
+            "❌ <b>Слишком крупный план или лицо обрезано!</b>\n\n"
+            "Нам нужно видеть овал лица целиком, чтобы художник уловил все черты. Пожалуйста, не присылайте макро-фото глаз или обрезанные селфи. Идеально подойдет обычный портрет или фото по пояс."
         )
         return
 
@@ -408,6 +524,9 @@ async def finish_relatives(message: types.Message, state: FSMContext):
 
 @dp.message(OrderFlow.waiting_for_pet_photo, F.photo)
 async def pet_photo(message: types.Message, state: FSMContext):
+    if message.media_group_id:
+        await message.answer("❌ <b>Пожалуйста, присылайте строго по ОДНОМУ фото за раз!</b>\nЯ не умею обрабатывать альбомы. Выберите одно лучшее фото и отправьте его.")
+        return
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     temp_name = f"temp_pet_{photo.file_id[:10]}.jpg"
@@ -438,7 +557,7 @@ async def pet_caption(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
-@dp.message(OrderFlow.waiting_for_pet_photo)
+@dp.message(OrderFlow.waiting_for_pet_photo, F.text == "➡️ Нет животных / Готово")
 async def finish_pets(message: types.Message, state: FSMContext):
     await message.answer(
         "Принято! 🐾\n\n"
@@ -453,6 +572,9 @@ async def finish_pets(message: types.Message, state: FSMContext):
 
 @dp.message(OrderFlow.waiting_for_toy_photo, F.photo)
 async def toy_photo(message: types.Message, state: FSMContext):
+    if message.media_group_id:
+        await message.answer("❌ <b>Пожалуйста, присылайте строго по ОДНОМУ фото за раз!</b>\nЯ не умею обрабатывать альбомы. Выберите одно лучшее фото и отправьте его.")
+        return
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     temp_name = f"temp_toy_{photo.file_id[:10]}.jpg"
@@ -477,18 +599,42 @@ async def toy_caption(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
-@dp.message(OrderFlow.waiting_for_toy_photo)
+@dp.message(OrderFlow.waiting_for_toy_photo, F.text == "➡️ Нет игрушки / Закончить")
 async def skip_toy_and_finish(message: types.Message, state: FSMContext):
     await finish_all(message, state)
 
+# ================= КАПКАНЫ ДЛЯ ОШИБОК =================
+# Эти хендлеры сработают ТОЛЬКО если пользователь прислал не тот тип данных
 
+# 1. Если ждем ТЕКСТ (имя, контакты, стиль, подписи), а прислали фото, кружок или стикер
+@dp.message(OrderFlow.waiting_for_name, ~F.text)
+@dp.message(OrderFlow.waiting_for_contact, ~F.text)
+@dp.message(OrderFlow.waiting_for_style, ~F.text)
+@dp.message(OrderFlow.waiting_for_relative_caption, ~F.text)
+@dp.message(OrderFlow.waiting_for_pet_caption, ~F.text)
+@dp.message(OrderFlow.waiting_for_toy_caption, ~F.text)
+async def catch_not_text(message: types.Message):
+    await message.answer("⚠️ <b>Пожалуйста, напишите ответ текстом!</b>\nЯ сейчас жду от вас текстовое сообщение, а не картинку или стикер.")
+
+# 2. Если ждем ФОТО, а прислали текст или что-то другое
+@dp.message(OrderFlow.waiting_for_relative_photo, ~F.photo)
+@dp.message(OrderFlow.waiting_for_pet_photo, ~F.photo)
+@dp.message(OrderFlow.waiting_for_toy_photo, ~F.photo)
+async def catch_not_photo(message: types.Message):
+    await message.answer(
+        "⚠️ <b>Я жду от вас фотографию! 📸</b>\n"
+        "Пожалуйста, прикрепите изображение как обычное фото. "
+        "Если вы хотите пропустить этот шаг — нажмите соответствующую кнопку внизу экрана."
+    )
+# =======================================================
 
 # --- АДМИНСКИЕ КОМАНДЫ ---
 
 async def finish_all(message: types.Message, state: FSMContext):
     data = await state.get_data()
     link = data.get('folder_link', 'нет ссылки')
-    full_name_str = data.get('full_name', 'Клиент') # Например: "Иванов Иван (Миша) @nik"
+    full_name_str = data.get('full_name', 'Клиент')
+    style = data.get('book_style', 'Не указан')
     
     # 1. Извлекаем переменные (защита от неверного ввода - если не цифра, ставим дефолт)
     try:
@@ -498,8 +644,7 @@ async def finish_all(message: types.Message, state: FSMContext):
     except ValueError:
         age, main_count, total_count = 0, 1, 1
 
-    # 2. Парсим Имя заказчика и Имя ребенка
-    # Ищем шаблон "Имя (Ребенок) Контакт"
+    
     match = re.search(r"^(.*?)\s*\((.*?)\)\s*(.*)$", full_name_str)
     if match:
         customer_name = f"{match.group(1).strip()} {match.group(3).strip()}" # Иванов Иван @nik
@@ -520,7 +665,7 @@ async def finish_all(message: types.Message, state: FSMContext):
     else:
         complexity += 4
         
-    complexity_str = "⭐" * complexity
+    complexity_str = f"{complexity} ⭐"
 
     # 4. МАТЕМАТИКА: Стоимость книги
     base_cost = 60 if total_count > 7 else 50
@@ -536,7 +681,7 @@ async def finish_all(message: types.Message, state: FSMContext):
     cost_str = f"{int(cost)} BYN"
 
     # 5. ОТПРАВЛЯЕМ ДАННЫЕ В ТАБЛИЦУ
-    row_data = [customer_name, child_name, total_count, complexity_str, cost_str]
+    row_data = [customer_name, child_name, total_count, complexity_str, cost_str, style]
     await asyncio.to_thread(append_to_sheet, row_data)
 
     # 6. ОТПРАВЛЯЕМ СООБЩЕНИЕ КЛИЕНТУ
@@ -569,16 +714,15 @@ async def finish_all(message: types.Message, state: FSMContext):
     start_time = data.get('start_time', time.time())
     duration_sec = int(time.time() - start_time)
     had_bad_photo = 1 if data.get('had_bad_photo') else 0
-    
-    # Получаем текущий месяц в формате "MM-YYYY" (например, "03-2026")
     current_month_year = datetime.now().strftime("%m-%Y")
 
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
+
         cursor.execute(
-            "INSERT INTO monthly_stats (month_year, duration_sec, total_chars, had_bad_photo) VALUES (?, ?, ?, ?)",
-            (current_month_year, duration_sec, total_count, had_bad_photo)
+            "INSERT INTO monthly_stats (month_year, duration_sec, total_chars, had_bad_photo, cost) VALUES (?, ?, ?, ?, ?)",
+            (current_month_year, duration_sec, total_count, had_bad_photo, int(cost))
         )
         conn.commit()
         conn.close()
@@ -638,7 +782,6 @@ async def cmd_manual(message: types.Message, command: CommandObject, state: FSMC
     
     
 async def send_monthly_stats():
-    # Вычисляем прошлый месяц
     now = datetime.now()
     if now.month == 1:
         prev_month = 12
@@ -651,29 +794,27 @@ async def send_monthly_stats():
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT duration_sec, total_chars, had_bad_photo FROM monthly_stats WHERE month_year = ?", (target_month_str,))
+    # ДОБАВИЛИ cost В ВЫБОРКУ:
+    cursor.execute("SELECT duration_sec, total_chars, had_bad_photo, cost FROM monthly_stats WHERE month_year = ?", (target_month_str,))
     records = cursor.fetchall()
     conn.close()
 
     if not records:
-        return # Если заказов не было, ничего не отправляем
+        return 
 
     total_orders = len(records)
     sum_duration = sum(row[0] for row in records)
     sum_chars = sum(row[1] for row in records)
     sum_bad_photos = sum(row[2] for row in records)
+    
+    # СЧИТАЕМ ВЫРУЧКУ (row[3] - это наша колонка cost. Защита от старых записей без цены)
+    total_revenue = sum((row[3] if row[3] is not None else 0) for row in records)
 
-    # Математика
     avg_duration_sec = sum_duration / total_orders
     avg_mins = int(avg_duration_sec // 60)
-    
-    # Правильное математическое округление до целого
     avg_chars = int(sum_chars / total_orders + 0.5) 
-    
-    # Процент плохих фото
     bad_photo_percent = int((sum_bad_photos / total_orders) * 100)
 
-    # Отправляем админам
     for admin_id in ADMIN_ID:
         try:
             await bot.send_message(
@@ -681,6 +822,7 @@ async def send_monthly_stats():
                 text=(
                     f"📈 <b>СТАТИСТИКА ЗА ПРОШЛЫЙ МЕСЯЦ</b> ({target_month_str})\n\n"
                     f"📦 Всего заказов: <b>{total_orders}</b>\n"
+                    f"💵 Выручка: <b>{total_revenue} BYN</b>\n"
                     f"⏱ Среднее время заполнения: <b>~{avg_mins} мин.</b>\n"
                     f"👥 Среднее кол-во героев: <b>{avg_chars}</b>\n"
                     f"⚠️ Доля клиентов с плохими фото: <b>{bad_photo_percent}%</b>\n\n"
