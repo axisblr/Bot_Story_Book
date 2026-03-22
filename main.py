@@ -246,35 +246,37 @@ async def cmd_start(message: types.Message, state: FSMContext):
         reply_markup=get_onboarding_keyboard()
     )
     await state.set_state(OrderFlow.waiting_for_bot_knowledge)
-    
-    @dp.message(Command("restart"))
-    async def cmd_restart(message: types.Message, state: FSMContext):
-        data = await state.get_data()
+
+
+# ВАЖНО: Эта функция идет строго ПОСЛЕ предыдущей, без отступов слева!
+@dp.message(Command("restart"))
+async def cmd_restart(message: types.Message, state: FSMContext):
+    data = await state.get_data()
     
     # Проверяем, дошел ли человек вообще до создания папки
-        if 'current_folder_id' not in data:
-            await message.answer(
-                "⚠️ Вы еще не начали оформление заказа или папка не была создана.\n"
-                "Пожалуйста, нажмите /start, чтобы начать с самого начала."
-            )
-            return
+    if 'current_folder_id' not in data:
+        await message.answer(
+            "⚠️ Вы еще не начали оформление заказа или папка не была создана.\n"
+            "Пожалуйста, нажмите /start, чтобы начать с самого начала."
+        )
+        return
 
-        # Если папка есть, просто откатываем состояние до приема первого фото родственников
-        await state.set_state(OrderFlow.waiting_for_relative_photo)
-        
-        await message.answer(
-            "🙌 <b>Ничего страшного, с каждым могло случиться! Все абсолютно под контролем.</b>\n\n"
-            "Ваша персональная папка никуда не пропала, и все ответы на вопросы сохранены. Мы просто сбросили процесс загрузки.\n\n"
-            "Начинайте загружать фото заново (строго по одному!). Если нужно освежить в памяти правила выбора фото — просто пролистайте чат немного вверх.\n\n"
-            "👇 <b>Жду первое фото!</b>",
-            reply_markup=ReplyKeyboardRemove() # На всякий случай убираем старые кнопки
-        )
-        
-        # Снова показываем кнопку "Все люди загружены", чтобы она была под рукой
-        await message.answer(
-            "После каждого фото я спрошу имя. Когда загрузите всех, нажмите кнопку:", 
-            reply_markup=get_done_keyboard("✅ Все люди загружены")
-        )
+    # Если папка есть, просто откатываем состояние до приема первого фото родственников
+    await state.set_state(OrderFlow.waiting_for_relative_photo)
+    
+    await message.answer(
+        "🙌 <b>Ничего страшного, с каждым могло случиться! Все абсолютно под контролем.</b>\n\n"
+        "Ваша персональная папка никуда не пропала, и все ответы на вопросы сохранены. Мы просто сбросили процесс загрузки.\n\n"
+        "Начинайте загружать фото заново (строго по одному!). Если нужно освежить в памяти правила выбора фото — просто пролистайте чат немного вверх.\n\n"
+        "👇 <b>Жду первое фото!</b>",
+        reply_markup=ReplyKeyboardRemove() # На всякий случай убираем старые кнопки
+    )
+    
+    # Снова показываем кнопку "Все люди загружены", чтобы она была под рукой
+    await message.answer(
+        "После каждого фото я спрошу имя. Когда загрузите всех, нажмите кнопку:", 
+        reply_markup=get_done_keyboard("✅ Все люди загружены")
+    )
 
 
 @dp.message(OrderFlow.waiting_for_bot_knowledge, F.text == "🤔 Нет, расскажите, как это работает")
@@ -306,7 +308,8 @@ async def start_questionnaire(message: types.Message, state: FSMContext):
     )
     await state.set_state(OrderFlow.waiting_for_name)
 
-@dp.message(OrderFlow.waiting_for_name)
+
+@dp.message(OrderFlow.waiting_for_name, F.text, ~F.text.startswith('/'))
 async def process_name(message: types.Message, state: FSMContext):
     await state.update_data(client_name_part=message.text)
     await message.answer(
@@ -317,7 +320,8 @@ async def process_name(message: types.Message, state: FSMContext):
     )
     await state.set_state(OrderFlow.waiting_for_contact)
 
-@dp.message(OrderFlow.waiting_for_contact)
+
+@dp.message(OrderFlow.waiting_for_contact, F.text, ~F.text.startswith('/'))
 async def process_contact(message: types.Message, state: FSMContext):
     contact = message.text
     data = await state.get_data()
@@ -392,13 +396,10 @@ async def process_main_chars_age(message: types.Message, state: FSMContext):
     await state.set_state(OrderFlow.waiting_for_style)
 
 
-# ВАЖНО: Эта функция идет строго ПОСЛЕ предыдущей, без отступов слева!
-@dp.message(OrderFlow.waiting_for_style)
+@dp.message(OrderFlow.waiting_for_style, F.text, ~F.text.startswith('/'))
 async def process_book_style(message: types.Message, state: FSMContext):
-    # Сохраняем выбранный стиль
     await state.update_data(book_style=message.text)
     
-    # Выдаем ТВОЮ ОБНОВЛЕННУЮ ПАМЯТКУ (один раз)
     await message.answer(
         "Отлично! Все вводные данные собраны. 📝\n\n"
         "Теперь переходим к самому важному — загрузке фотографий...\n\n"
@@ -486,7 +487,7 @@ async def relative_photo(message: types.Message, state: FSMContext):
 
 
 
-@dp.message(OrderFlow.waiting_for_relative_caption)
+@dp.message(OrderFlow.waiting_for_relative_caption, F.text, ~F.text.startswith('/'))
 async def relative_caption(message: types.Message, state: FSMContext):
     name = clean_filename(message.text)
     filename = f"{name}.jpg"
@@ -536,7 +537,8 @@ async def pet_photo(message: types.Message, state: FSMContext):
     await message.reply("🐾 <b>Милаха!</b> Как зовут? (и кто это?)", reply_markup=ReplyKeyboardRemove())
     await state.set_state(OrderFlow.waiting_for_pet_caption)
 
-@dp.message(OrderFlow.waiting_for_pet_caption)
+
+@dp.message(OrderFlow.waiting_for_pet_caption, F.text, ~F.text.startswith('/'))
 async def pet_caption(message: types.Message, state: FSMContext):
     name = clean_filename(message.text)
     filename = f"Питомец {name}.jpg"
@@ -557,6 +559,7 @@ async def pet_caption(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
+
 @dp.message(OrderFlow.waiting_for_pet_photo, F.text == "➡️ Нет животных / Готово")
 async def finish_pets(message: types.Message, state: FSMContext):
     await message.answer(
@@ -568,7 +571,9 @@ async def finish_pets(message: types.Message, state: FSMContext):
     )
     await state.set_state(OrderFlow.waiting_for_toy_photo)
 
+
 # --- БЛОК ИГРУШКИ ---
+
 
 @dp.message(OrderFlow.waiting_for_toy_photo, F.photo)
 async def toy_photo(message: types.Message, state: FSMContext):
@@ -584,7 +589,7 @@ async def toy_photo(message: types.Message, state: FSMContext):
     await message.reply("🧸 <b>Вижу!</b> Как называется игрушка?", reply_markup=ReplyKeyboardRemove())
     await state.set_state(OrderFlow.waiting_for_toy_caption)
 
-@dp.message(OrderFlow.waiting_for_toy_caption)
+@dp.message(OrderFlow.waiting_for_toy_caption, F.text, ~F.text.startswith('/'))
 async def toy_caption(message: types.Message, state: FSMContext):
     name = clean_filename(message.text)
     filename = f"Игрушка {name}.jpg"
