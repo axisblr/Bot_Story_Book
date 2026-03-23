@@ -183,7 +183,7 @@ def append_to_sheet(row_data):
         body = {'values': [row_data]}
         sheets_service.spreadsheets().values().append(
             spreadsheetId=os.getenv("SPREADSHEET_ID"),
-            range="A:F", 
+            range="A:G", 
             valueInputOption="USER_ENTERED",
             body=body
         ).execute()
@@ -284,14 +284,14 @@ async def explain_bot_logic(message: types.Message):
     # Если человек не знает, что такое бот, объясняем очень просто
     await message.answer(
         "💡 <b>Не волнуйтесь, это очень просто!</b>\n\n"
-        "Представьте, что я — строгий, но вежливый библиотекарь 🤓\n"
+        "Представьте, что я — ваш друг, с которым вы просто переписываетесь в Telegram. Вы точно так же пишите мне в чат, отправляете фото и т.д.\n"
         "Я не умею поддерживать светскую беседу или отвечать на сложные вопросы (я не искусственный интеллект, как ChatGPT).\n\n"
         "<b>Моя работа строится строго по шагам:</b>\n"
         "1️⃣ Я задаю вам конкретный вопрос (например, «Как вас зовут?»).\n"
         "2️⃣ Вы пишете ответ в чат и отправляете его мне. Примерно так же, как вы бы писали любому другому человеку в Telegram\n"
         "3️⃣ Я сохраняю ответ и задаю следующий вопрос или прошу прислать фото.\n\n"
         "⚠️ <i>Самое главное: отвечайте строго на тот вопрос, который я задал, и присылайте фото только тогда, когда я об этом попрошу.</i>\n\n"
-        "Готовы попробовать? Жмите кнопку ниже!",
+        "Готовы начинать? Жмите кнопку ниже!",
         reply_markup=get_start_after_help_keyboard()
     )
     
@@ -302,8 +302,8 @@ async def start_questionnaire(message: types.Message, state: FSMContext):
     await message.answer(
         "Отлично! Тогда давайте приступим к оформлению вашей персональной папки.\n\n"
         "📝 <b>Напишите одним сообщением:</b>\n"
-        "<code>Ваше Имя Фамилию (Имя ребенка)</code>\n\n"
-        "<i>Например: Иванова Анна (Миша)</i>",
+        "<code>Ваше Имя собственное и Фамилию (Имя ребенка)</code>\n\n"
+        "<i>Например: Иванов Антон (Миша)</i>",
         reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(OrderFlow.waiting_for_name)
@@ -315,8 +315,8 @@ async def process_name(message: types.Message, state: FSMContext):
     await message.answer(
         "👍 <b>Имя принято!</b>\n\n"
         "Теперь укажи контакт для связи.\n"
-        "Напиши свой <b>Ник в Telegram</b> (через @) или <b>номер WhatsApp</b>.\n\n"
-        "<i>Я добавлю это в название папки, чтобы понимать, чей это заказ.</i>"
+        "Напиши свой <b>Ник в Telegram</b> (через @) или <b>номер ваш номер</b>.\n\n"
+        "<i>Не волнуйтесь, эти данные никуда не уйдут. Я добавлю это в название папки, чтобы понимать, чей это заказ.</i>"
     )
     await state.set_state(OrderFlow.waiting_for_contact)
 
@@ -341,6 +341,7 @@ async def process_contact(message: types.Message, state: FSMContext):
             "📝 <b>Перед тем как мы перейдем к фото, ответьте, пожалуйста, на 4 коротких вопроса.</b>\n"
             "Это очень поможет нам в создании вашей книги!\n\n"
             "1️⃣ <b>Сколько главных героев будет в книге?</b>\n"
+            "Главным героем считается тот, для кого будет книга. Это может быть ваш ребёнок (дети) или родственники (Дедушка с бабушкой, Брат и т.д.)\n"
             "<i>(Пожалуйста, напишите в чат только цифру)</i>"
         )
         await state.set_state(OrderFlow.waiting_for_main_chars_count)
@@ -373,25 +374,26 @@ async def process_total_chars_count(message: types.Message, state: FSMContext):
     await state.update_data(total_chars_count=message.text)
     
     await message.answer(
-        "Принято! И последний вопрос ⏳\n\n"
+        "Принято! Идём дальше ⏳\n\n"
         "3️⃣ <b>Какой возраст у главного героя (или героев)?</b>\n"
-        "<i>(Напишите только цифру в чат)</i>"
+        "<i>Если главный герой 1 - напишите только цифру в чат</i>\n"
+        "<i>Если их несколько - напишите их возраста через запятую (порядок записи не важен). Например: 3, 12</i>"
     )
     await state.set_state(OrderFlow.waiting_for_main_chars_age)
 
 
 @dp.message(OrderFlow.waiting_for_main_chars_age, F.text)
 async def process_main_chars_age(message: types.Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.answer("⚠️ Пожалуйста, напишите **только цифру**.")
+    if not re.match(r'^[\d,\s]+$', message.text):
+        await message.answer("⚠️ Пожалуйста, напишите только цифры (и запятые, если героев несколько).")
         return
     await state.update_data(main_chars_age=message.text)
     
     await message.answer(
         "🎨 <b>И последний вопрос перед загрузкой фото!</b>\n\n"
         "Вы уже ознакомились с нашим PDF-файлом, где представлены стили иллюстраций.\n"
-        "Напишите, пожалуйста, какой стиль для вашей книги вы выбрали?\n"
-        "<i>(Например: Дисней, Реализм или любой другой из файла)</i>"
+        "Напишите, пожалуйста, одним словом, какой стиль для вашей книги вы выбрали?\n"
+        "<i>(Например: Дисней или Реализм)</i>"
     )
     await state.set_state(OrderFlow.waiting_for_style)
 
@@ -403,6 +405,9 @@ async def process_book_style(message: types.Message, state: FSMContext):
     await message.answer(
         "Отлично! Все вводные данные собраны. 📝\n\n"
         "Теперь переходим к самому важному — загрузке фотографий...\n\n"
+        "Перед началом еще один важный момент: пожалуйста, присылайте <b>по одному фото за раз</b>. Я не умею обрабатывать альбомы фотографий.\n"
+        "Вы отправили мне фото -> Я его проверяю -> Если все OK, то прошу вас написать <b>Кто на фото</b> (например: Мама Оля, Дедушка Валера, Тетя Полина и т.д.)."
+        "И в таком формате вы загружаете все остальные фото!\n\n"
         "📸 <b>ВАЖНО: Как выбрать фото?</b>\n\n"
         "Чтобы мы смогли описать внешность максимально точно, пожалуйста, следуйте этим советам:\n\n"
         "1️⃣ <b>Четкость и детали</b>\n"
@@ -418,7 +423,7 @@ async def process_book_style(message: types.Message, state: FSMContext):
 
     # Показываем кнопку "Готово"
     await message.answer(
-        "После каждого фото я спрошу имя. Когда загрузите всех, нажмите кнопку:", 
+        "После каждого фото я спрошу у вас 'Кто это?'. Когда загрузите всех, нажмите кнопку:", 
         reply_markup=get_done_keyboard("✅ Все люди загружены")
     )
     
@@ -430,6 +435,13 @@ async def process_book_style(message: types.Message, state: FSMContext):
 @dp.message(OrderFlow.waiting_for_relative_photo, F.photo)
 async def relative_photo(message: types.Message, state: FSMContext):
     if message.media_group_id:
+        data = await state.get_data()
+        # Если мы уже ругались на этот альбом, просто молча игнорируем остальные фотки
+        if data.get("last_error_group") == message.media_group_id:
+            return 
+        
+        # Запоминаем ID этого альбома и выдаем ошибку ОДИН раз
+        await state.update_data(last_error_group=message.media_group_id)
         await message.answer("❌ <b>Пожалуйста, присылайте строго по ОДНОМУ фото за раз!</b>\nЯ не умею обрабатывать альбомы. Выберите одно лучшее фото и отправьте его.")
         return
     photo = message.photo[-1]
@@ -480,7 +492,7 @@ async def relative_photo(message: types.Message, state: FSMContext):
     await state.update_data(temp_photo_path=temp_name)
     await message.reply(
         "📸 <b>Фото прошло проверку и принято!</b>\n"
-        "Напиши: <b>Кто это?</b> (например: Мама Оля, Дедушка Валера, Тетя Полина и т.д.)", 
+        "Напишити пожалуйста: <b>Кто это?</b> (например: Мама Оля, Дедушка Валера, Тетя Полина и т.д.)", 
         reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(OrderFlow.waiting_for_relative_caption)
@@ -501,7 +513,7 @@ async def relative_caption(message: types.Message, state: FSMContext):
 
         await message.answer(
             f"✅ <b>{name}</b> сохранен!\n"
-            "Присылай следующее фото или жми кнопку.",
+            "Жду от вас следующее фото или (если вы завершили с загрузкой людей) - нажимайте кнопку.",
             reply_markup=get_done_keyboard("✅ Все люди загружены")
         )
         await state.set_state(OrderFlow.waiting_for_relative_photo)
@@ -515,8 +527,8 @@ async def finish_relatives(message: types.Message, state: FSMContext):
     await message.answer(
         "Отлично, с людьми закончили! 👨‍👩‍👧‍👦\n\n"
         "4️⃣ <b>Есть ли у вас домашние животные?</b> 🐶🐱\n"
-        "Если <b>ЕСТЬ</b>: Просто пришли фото питомца.\n"
-        "Если <b>НЕТ</b>: Нажми кнопку ниже.",
+        "Если <b>ЕСТЬ</b>: Просто пришлите фото питомца.\n"
+        "Если <b>НЕТ</b>: Нажмити кнопку ниже.",
         reply_markup=get_skip_keyboard("📸 Фото питомца", "➡️ Нет животных / Готово")
     )
     await state.set_state(OrderFlow.waiting_for_pet_photo)
@@ -526,6 +538,13 @@ async def finish_relatives(message: types.Message, state: FSMContext):
 @dp.message(OrderFlow.waiting_for_pet_photo, F.photo)
 async def pet_photo(message: types.Message, state: FSMContext):
     if message.media_group_id:
+        data = await state.get_data()
+        # Если мы уже ругались на этот альбом, просто молча игнорируем остальные фотки
+        if data.get("last_error_group") == message.media_group_id:
+            return 
+        
+        # Запоминаем ID этого альбома и выдаем ошибку ОДИН раз
+        await state.update_data(last_error_group=message.media_group_id)
         await message.answer("❌ <b>Пожалуйста, присылайте строго по ОДНОМУ фото за раз!</b>\nЯ не умею обрабатывать альбомы. Выберите одно лучшее фото и отправьте его.")
         return
     photo = message.photo[-1]
@@ -552,7 +571,7 @@ async def pet_caption(message: types.Message, state: FSMContext):
 
         await message.answer(
             f"✅ <b>{name}</b> в домике!\n"
-            "Есть еще животные? Присылай фото или жми кнопку.",
+            "Есть еще животные? Присылайте фото или нажимайте кнопку.",
             reply_markup=get_skip_keyboard(no_text="➡️ Готово, идем к игрушкам")
         )
         await state.set_state(OrderFlow.waiting_for_pet_photo)
@@ -564,9 +583,9 @@ async def pet_caption(message: types.Message, state: FSMContext):
 async def finish_pets(message: types.Message, state: FSMContext):
     await message.answer(
         "Принято! 🐾\n\n"
-        "5️⃣ <b>Последний вопрос: Любимая игрушка</b> 🧸\n"
-        "Если <b>ЕСТЬ</b>: Пришли её фото.\n"
-        "Если <b>НЕТ</b>: Нажми кнопку ниже.",
+        "5️⃣ <b>Последний вопрос: Любимая игрушка вашего малыша</b> 🧸\n"
+        "Если <b>ЕСТЬ</b>: Пришлите её фото.\n"
+        "Если <b>НЕТ</b>: Нажимайте кнопку ниже.",
         reply_markup=get_skip_keyboard(no_text="➡️ Нет игрушки / Закончить")
     )
     await state.set_state(OrderFlow.waiting_for_toy_photo)
@@ -578,6 +597,13 @@ async def finish_pets(message: types.Message, state: FSMContext):
 @dp.message(OrderFlow.waiting_for_toy_photo, F.photo)
 async def toy_photo(message: types.Message, state: FSMContext):
     if message.media_group_id:
+        data = await state.get_data()
+        # Если мы уже ругались на этот альбом, просто молча игнорируем остальные фотки
+        if data.get("last_error_group") == message.media_group_id:
+            return 
+        
+        # Запоминаем ID этого альбома и выдаем ошибку ОДИН раз
+        await state.update_data(last_error_group=message.media_group_id)
         await message.answer("❌ <b>Пожалуйста, присылайте строго по ОДНОМУ фото за раз!</b>\nЯ не умею обрабатывать альбомы. Выберите одно лучшее фото и отправьте его.")
         return
     photo = message.photo[-1]
@@ -641,13 +667,15 @@ async def finish_all(message: types.Message, state: FSMContext):
     full_name_str = data.get('full_name', 'Клиент')
     style = data.get('book_style', 'Не указан')
     
-    # 1. Извлекаем переменные (защита от неверного ввода - если не цифра, ставим дефолт)
+    age_str = data.get('main_chars_age', '0')
     try:
-        age = int(data.get('main_chars_age', 0))
+        ages = [int(x) for x in re.findall(r'\d+', age_str)]
+        min_age = min(ages) if ages else 0 
+        
         main_count = int(data.get('main_chars_count', 1))
         total_count = int(data.get('total_chars_count', 1))
     except ValueError:
-        age, main_count, total_count = 0, 1, 1
+        min_age, main_count, total_count = 0, 1, 1
 
     
     match = re.search(r"^(.*?)\s*\((.*?)\)\s*(.*)$", full_name_str)
@@ -660,7 +688,7 @@ async def finish_all(message: types.Message, state: FSMContext):
 
     # 3. МАТЕМАТИКА: Сложность заказа
     complexity = 0
-    complexity += 2 if age <= 3 else 3
+    complexity += 2 if min_age <= 3 else 3
     complexity += 1 if main_count == 1 else 3
     
     if total_count <= 7:
@@ -686,7 +714,7 @@ async def finish_all(message: types.Message, state: FSMContext):
     cost_str = f"{int(cost)} BYN"
 
     # 5. ОТПРАВЛЯЕМ ДАННЫЕ В ТАБЛИЦУ
-    row_data = [customer_name, child_name, total_count, complexity_str, cost_str, style]
+    row_data = [customer_name, child_name, total_count, complexity_str, cost_str, style, age_str]
     await asyncio.to_thread(append_to_sheet, row_data)
 
     # 6. ОТПРАВЛЯЕМ СООБЩЕНИЕ КЛИЕНТУ
@@ -705,6 +733,7 @@ async def finish_all(message: types.Message, state: FSMContext):
                     f"🔔 <b>НОВЫЙ ЗАКАЗ!</b>\n\n"
                     f"👤 Заказчик: <b>{customer_name}</b>\n"
                     f"👶 Ребенок: <b>{child_name}</b>\n"
+                    f"🎂 Возраст: <b>{age_str}</b>\n"
                     f"👥 Всего героев: <b>{total_count}</b>\n"
                     f"📊 Сложность: <b>{complexity_str}</b>\n"
                     f"💰 Расчетная сумма: <b>{cost_str}</b>\n\n"
