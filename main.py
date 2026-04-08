@@ -44,7 +44,7 @@ def init_db():
             month_year TEXT,
             duration_sec INTEGER,
             total_chars INTEGER,
-            had_bad_photo INTEGER
+            had_bad_photo INTEGER,
             cost INTEGER
         )
     ''')
@@ -429,6 +429,36 @@ async def process_book_style(message: types.Message, state: FSMContext):
     
     # Переводим бота в режим ожидания фотографий
     await state.set_state(OrderFlow.waiting_for_relative_photo)
+    
+    # ================= УНИВЕРСАЛЬНЫЕ КНОПКИ ЗАВЕРШЕНИЯ =================
+# Эти кнопки сработают В ЛЮБОЙ МОМЕНТ, независимо от того, что ждет бот
+
+@dp.message(F.text == "✅ Все люди загружены")
+async def finish_relatives(message: types.Message, state: FSMContext):
+    await message.answer(
+        "Отлично, с людьми закончили! 👨‍👩‍👧‍👦\n\n"
+        "4️⃣ <b>Есть ли у вас домашние животные?</b> 🐶🐱\n"
+        "Если <b>ЕСТЬ</b>: Просто пришлите фото питомца.\n"
+        "Если <b>НЕТ</b>: Нажмити кнопку ниже.",
+        reply_markup=get_skip_keyboard("📸 Фото питомца", "➡️ Нет животных / Готово")
+    )
+    await state.set_state(OrderFlow.waiting_for_pet_photo)
+
+@dp.message(F.text.in_(["➡️ Нет животных / Готово", "➡️ Готово, идем к игрушкам"]))
+async def finish_pets(message: types.Message, state: FSMContext):
+    await message.answer(
+        "Принято! 🐾\n\n"
+        "5️⃣ <b>Последний вопрос: Любимая игрушка вашего малыша</b> 🧸\n"
+        "Если <b>ЕСТЬ</b>: Пришлите её фото.\n"
+        "Если <b>НЕТ</b>: Нажимайте кнопку ниже.",
+        reply_markup=get_skip_keyboard(no_text="➡️ Нет игрушки / Закончить")
+    )
+    await state.set_state(OrderFlow.waiting_for_toy_photo)
+
+@dp.message(F.text == "➡️ Нет игрушки / Закончить")
+async def skip_toy_and_finish(message: types.Message, state: FSMContext):
+    await finish_all(message, state)
+# ===================================================================
 
 # --- БЛОК РОДСТВЕННИКОВ ---
 
@@ -520,19 +550,6 @@ async def relative_caption(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
-
-
-@dp.message(OrderFlow.waiting_for_relative_photo, F.text == "✅ Все люди загружены")
-async def finish_relatives(message: types.Message, state: FSMContext):
-    await message.answer(
-        "Отлично, с людьми закончили! 👨‍👩‍👧‍👦\n\n"
-        "4️⃣ <b>Есть ли у вас домашние животные?</b> 🐶🐱\n"
-        "Если <b>ЕСТЬ</b>: Просто пришлите фото питомца.\n"
-        "Если <b>НЕТ</b>: Нажмити кнопку ниже.",
-        reply_markup=get_skip_keyboard("📸 Фото питомца", "➡️ Нет животных / Готово")
-    )
-    await state.set_state(OrderFlow.waiting_for_pet_photo)
-
 # --- БЛОК ПИТОМЦЕВ ---
 
 @dp.message(OrderFlow.waiting_for_pet_photo, F.photo)
@@ -578,19 +595,6 @@ async def pet_caption(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
-
-@dp.message(OrderFlow.waiting_for_pet_photo, F.text.in_(["➡️ Нет животных / Готово", "➡️ Готово, идем к игрушкам"]))
-async def finish_pets(message: types.Message, state: FSMContext):
-    await message.answer(
-        "Принято! 🐾\n\n"
-        "5️⃣ <b>Последний вопрос: Любимая игрушка вашего малыша</b> 🧸\n"
-        "Если <b>ЕСТЬ</b>: Пришлите её фото.\n"
-        "Если <b>НЕТ</b>: Нажимайте кнопку ниже.",
-        reply_markup=get_skip_keyboard(no_text="➡️ Нет игрушки / Закончить")
-    )
-    await state.set_state(OrderFlow.waiting_for_toy_photo)
-
-
 # --- БЛОК ИГРУШКИ ---
 
 
@@ -630,10 +634,6 @@ async def toy_caption(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
-@dp.message(OrderFlow.waiting_for_toy_photo, F.text == "➡️ Нет игрушки / Закончить")
-async def skip_toy_and_finish(message: types.Message, state: FSMContext):
-    await finish_all(message, state)
-
 # ================= КАПКАНЫ ДЛЯ ОШИБОК =================
 # Эти хендлеры сработают ТОЛЬКО если пользователь прислал не тот тип данных
 
@@ -648,9 +648,11 @@ async def catch_not_text(message: types.Message):
     await message.answer("⚠️ <b>Пожалуйста, напишите ответ текстом!</b>\nЯ сейчас жду от вас текстовое сообщение, а не картинку или стикер.")
 
 # 2. Если ждем ФОТО, а прислали текст или что-то другое
-@dp.message(OrderFlow.waiting_for_relative_photo, ~F.photo)
-@dp.message(OrderFlow.waiting_for_pet_photo, ~F.photo)
-@dp.message(OrderFlow.waiting_for_toy_photo, ~F.photo)
+ALL_DONE_TEXTS = ["✅ Все люди загружены", "➡️ Нет животных / Готово", "➡️ Готово, идем к игрушкам", "➡️ Нет игрушки / Закончить"]
+
+@dp.message(OrderFlow.waiting_for_relative_photo, ~F.photo, ~F.text.in_(ALL_DONE_TEXTS))
+@dp.message(OrderFlow.waiting_for_pet_photo, ~F.photo, ~F.text.in_(ALL_DONE_TEXTS))
+@dp.message(OrderFlow.waiting_for_toy_photo, ~F.photo, ~F.text.in_(ALL_DONE_TEXTS))
 async def catch_not_photo(message: types.Message):
     await message.answer(
         "⚠️ <b>Я жду от вас фотографию! 📸</b>\n"
