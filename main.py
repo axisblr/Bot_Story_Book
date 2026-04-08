@@ -248,7 +248,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.set_state(OrderFlow.waiting_for_bot_knowledge)
 
 
-# ВАЖНО: Эта функция идет строго ПОСЛЕ предыдущей, без отступов слева!
 @dp.message(Command("restart"))
 async def cmd_restart(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -277,6 +276,23 @@ async def cmd_restart(message: types.Message, state: FSMContext):
         "После каждого фото я спрошу имя. Когда загрузите всех, нажмите кнопку:", 
         reply_markup=get_done_keyboard("✅ Все люди загружены")
     )
+    
+    # ================= АВАРИЙНОЕ ЗАВЕРШЕНИЕ =================
+@dp.message(Command("done"))
+async def cmd_done(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    
+    # Защита: проверяем, начал ли человек вообще заказ
+    if 'current_folder_id' not in data:
+        await message.answer(
+            "⚠️ Вы еще не начали оформление заказа.\n"
+            "Пожалуйста, нажмите /start, чтобы начать."
+        )
+        return
+
+    # Если папка есть — бросаем всё и запускаем финальный расчет!
+    await message.answer("✅ <b>Принудительно завершаем оформление заказа...</b>")
+    await finish_all(message, state)
 
 
 @dp.message(OrderFlow.waiting_for_bot_knowledge, F.text == "🤔 Нет, расскажите, как это работает")
