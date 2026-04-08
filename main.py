@@ -579,7 +579,7 @@ async def pet_caption(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Ошибка: {e}")
 
 
-@dp.message(OrderFlow.waiting_for_pet_photo, F.text == "➡️ Нет животных / Готово")
+@dp.message(OrderFlow.waiting_for_pet_photo, F.text.in_(["➡️ Нет животных / Готово", "➡️ Готово, идем к игрушкам"]))
 async def finish_pets(message: types.Message, state: FSMContext):
     await message.answer(
         "Принято! 🐾\n\n"
