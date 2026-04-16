@@ -417,7 +417,19 @@ async def process_main_chars_age(message: types.Message, state: FSMContext):
 @dp.message(OrderFlow.waiting_for_style, F.text, ~F.text.startswith('/'))
 async def process_book_style(message: types.Message, state: FSMContext):
     await state.update_data(book_style=message.text)
+    data = await state.get_data()
+
+    full_info = data.get('full_name', 'Не указано') 
+    age_str = data.get('main_chars_age', '0')
+    style = message.text
+
+    draft_row = [full_info, "ЧЕРНОВИК (не нажал Готово)", "-", "-", "-", style, age_str]
     
+    try:
+        await asyncio.to_thread(append_to_sheet, draft_row)
+    except Exception as e:
+        logging.error(f"Ошибка при записи черновика: {e}")
+
     await message.answer(
         "Отлично! Все вводные данные собраны. 📝\n\n"
         "Теперь переходим к самому важному — загрузке фотографий...\n\n"
@@ -437,17 +449,14 @@ async def process_book_style(message: types.Message, state: FSMContext):
         "👇 <b>Теперь можно начинать! Жду первое фото.</b>"
     )
 
-    # Показываем кнопку "Готово"
     await message.answer(
         "После каждого фото я спрошу у вас 'Кто это?'. Когда загрузите всех, нажмите кнопку:", 
         reply_markup=get_done_keyboard("✅ Все люди загружены")
     )
     
-    # Переводим бота в режим ожидания фотографий
     await state.set_state(OrderFlow.waiting_for_relative_photo)
     
     # ================= УНИВЕРСАЛЬНЫЕ КНОПКИ ЗАВЕРШЕНИЯ =================
-# Эти кнопки сработают В ЛЮБОЙ МОМЕНТ, независимо от того, что ждет бот
 
 @dp.message(F.text == "✅ Все люди загружены")
 async def finish_relatives(message: types.Message, state: FSMContext):
