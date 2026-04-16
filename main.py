@@ -331,7 +331,7 @@ async def process_name(message: types.Message, state: FSMContext):
     await message.answer(
         "👍 <b>Имя принято!</b>\n\n"
         "Теперь укажи контакт для связи.\n"
-        "Напиши свой <b>Ник в Telegram</b> (через @) или <b>номер ваш номер</b>.\n\n"
+        "Напиши свой <b>Ник в Telegram</b> (через @) или <b>ваш номер телефона</b>.\n\n"
         "<i>Не волнуйтесь, эти данные никуда не уйдут. Я добавлю это в название папки, чтобы понимать, чей это заказ.</i>"
     )
     await state.set_state(OrderFlow.waiting_for_contact)
