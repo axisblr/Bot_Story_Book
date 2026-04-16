@@ -128,6 +128,7 @@ class OrderFlow(StatesGroup):
     waiting_for_total_chars_count = State()
     waiting_for_main_chars_age = State()
     waiting_for_style = State()
+    waiting_for_eye_colors = State()
 
     waiting_for_relative_photo = State()
     waiting_for_relative_caption = State()
@@ -409,7 +410,7 @@ async def process_main_chars_age(message: types.Message, state: FSMContext):
         "🎨 <b>И последний вопрос перед загрузкой фото!</b>\n\n"
         "Вы уже ознакомились с нашим PDF-файлом, где представлены стили иллюстраций.\n"
         "Напишите, пожалуйста, одним словом, какой стиль для вашей книги вы выбрали?\n"
-        "<i>(Например: Дисней или Реализм)</i>"
+        "<i>(Например: Дисней или Натурализм)</i>"
     )
     await state.set_state(OrderFlow.waiting_for_style)
 
@@ -423,7 +424,8 @@ async def process_book_style(message: types.Message, state: FSMContext):
     age_str = data.get('main_chars_age', '0')
     style = message.text
 
-    draft_row = [full_info, "ЧЕРНОВИК (не нажал Готово)", "-", "-", "-", style, age_str]
+    # Черновик теперь указывает, что клиент остановился на этапе цвета глаз
+    draft_row = [full_info, "ЧЕРНОВИК (на этапе цвета глаз)", "-", "-", "-", style, age_str]
     
     try:
         await asyncio.to_thread(append_to_sheet, draft_row)
@@ -431,7 +433,37 @@ async def process_book_style(message: types.Message, state: FSMContext):
         logging.error(f"Ошибка при записи черновика: {e}")
 
     await message.answer(
-        "Отлично! Все вводные данные собраны. 📝\n\n"
+        "👀 <b>Важный нюанс: Цвет глаз</b>\n\n"
+        "На фотографиях не всегда четко виден цвет глаз, а для сказки это очень важно.\n"
+        "Пожалуйста, напишите в одном сообщении прямо сюда мне в чат цвет глаз для всех героев вашей сказки.\n\n"
+        "<i>Например: Мама, Бабушка Саша, Сестра Оля — зеленые.</i>\n"
+        "<i>Папа, Дядя Сергей — карие.</i>\n"
+        "<i>Дедушка Артем, Полина, Тётя Света, Дедушка Володя — серо-голубые.</i>\n"
+        "Я сохраню это отдельной заметкой для наших художников 📝"
+    )
+    
+    await state.set_state(OrderFlow.waiting_for_eye_colors)
+
+
+@dp.message(OrderFlow.waiting_for_eye_colors, F.text, ~F.text.startswith('/'))
+async def process_eye_colors(message: types.Message, state: FSMContext):
+    eye_info = message.text
+    data = await state.get_data()
+    folder_id = data.get('current_folder_id')
+    
+    file_name = "цвет_глаз_героев.txt"
+    with open(file_name, "w", encoding="utf-8") as f:
+        f.write(f"Описание цвета глаз от клиента:\n\n{eye_info}")
+    
+    try:
+        await asyncio.to_thread(upload_file_to_drive, file_name, file_name, folder_id)
+        if os.path.exists(file_name): 
+            os.remove(file_name)
+    except Exception as e:
+        logging.error(f"Ошибка при загрузке TXT с глазами: {e}")
+
+    await message.answer(
+        "Принято! Заметку для художников сохранил. ✨\n\n"
         "Теперь переходим к самому важному — загрузке фотографий...\n\n"
         "Перед началом еще один важный момент: пожалуйста, присылайте <b>по одному фото за раз</b>. Я не умею обрабатывать альбомы фотографий.\n"
         "Вы отправили мне фото -> Я его проверяю -> Если все OK, то прошу вас написать <b>Кто на фото</b> (например: Мама Оля, Дедушка Валера, Тетя Полина и т.д.)."
