@@ -118,7 +118,6 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
-# --- МАШИНА СОСТОЯНИЙ ---
 class OrderFlow(StatesGroup):
     waiting_for_bot_knowledge = State()
     waiting_for_name = State()
@@ -138,6 +137,7 @@ class OrderFlow(StatesGroup):
 
     waiting_for_toy_photo = State()
     waiting_for_toy_caption = State()
+    waiting_for_agreement = State()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def create_drive_folder(folder_name, parent_id):
@@ -478,6 +478,8 @@ async def process_eye_colors(message: types.Message, state: FSMContext):
         "Можно присылать <b>1-2 фото</b> одного человека c разных ракурсов.\n<b>Однако очень важно понимать один момент:</b> герой будет одинаковым на всех иллюстрациях (прическа, одежда, цвет волос и тд). Поэтому только вам решать, в каком наряде вы бы хотели видеть вашего ребенка и родных на иллюстрациях. Присылать 1 или 2 фото одного человека более чем достаточно😊\nИ тем самым вы сами выбираете облик героя книги, который больше всего хотели бы именно <b>ВЫ</b>\n\n"
         "🔄 <b>АВАРИЙНАЯ КНОПКА:</b>\n"
         "Хоть я и стараюсь не давать вам совершить ошибку, ситуации бывают разные. Если вдруг что-то пошло не так, бот завис или вы запутались — просто отправьте мне команду /restart или выберите её в меню слева внизу.\n\n"
+        "🆘 <b>Нужна помощь или есть вопросы?</b>\n"
+        "Если бот завис, вы запутались или что-то пошло не так — пишите нашему иллюстратору: @bondtemaa. Он быстро во всем разберется и поможет!\n\n"
         "👇 <b>Теперь можно начинать! Жду первое фото.</b>"
     )
 
@@ -508,13 +510,13 @@ async def finish_pets(message: types.Message, state: FSMContext):
         "5️⃣ <b>Последний вопрос: Любимая игрушка вашего малыша</b> 🧸\n"
         "Если <b>ЕСТЬ</b>: Пришлите её фото.\n"
         "Если <b>НЕТ</b>: Нажимайте кнопку ниже.",
-        reply_markup=get_skip_keyboard(no_text="➡️ Нет игрушки / Закончить")
+        reply_markup=get_skip_keyboard(no_text="➡️ Нет игрушки / Далее") 
     )
     await state.set_state(OrderFlow.waiting_for_toy_photo)
 
-@dp.message(F.text == "➡️ Нет игрушки / Закончить")
-async def skip_toy_and_finish(message: types.Message, state: FSMContext):
-    await finish_all(message, state)
+@dp.message(F.text == "➡️ Нет игрушки / Далее") 
+async def skip_toy_and_agreement(message: types.Message, state: FSMContext):
+    await show_agreement(message, state)
 # ===================================================================
 
 # --- БЛОК РОДСТВЕННИКОВ ---
@@ -523,11 +525,10 @@ async def skip_toy_and_finish(message: types.Message, state: FSMContext):
 async def relative_photo(message: types.Message, state: FSMContext):
     if message.media_group_id:
         data = await state.get_data()
-        # Если мы уже ругались на этот альбом, просто молча игнорируем остальные фотки
+
         if data.get("last_error_group") == message.media_group_id:
             return 
-        
-        # Запоминаем ID этого альбома и выдаем ошибку ОДИН раз
+    
         await state.update_data(last_error_group=message.media_group_id)
         await message.answer("❌ <b>Пожалуйста, присылайте строго по ОДНОМУ фото за раз!</b>\nЯ не умею обрабатывать альбомы. Выберите одно лучшее фото и отправьте его.")
         return
@@ -536,19 +537,15 @@ async def relative_photo(message: types.Message, state: FSMContext):
     temp_name = f"temp_{photo.file_id[:10]}.jpg"
     await bot.download_file(file.file_path, temp_name)
     
-    # Отправляем сообщение "думаю", так как анализ займет пару секунд
     msg_thinking = await message.reply("👀 <i>Внимательно смотрю на фотографию...</i>")
     
-    # Запускаем проверку через Gemini
     check_result = await analyze_photo_quality(temp_name)
     
-    # Удаляем сообщение "думаю"
     await msg_thinking.delete()
 
-    # Проверяем условия и выдаем мягкие отказы
     if check_result.get("face_count", 0) > 1:
-        os.remove(temp_name) # Удаляем фотку
-        await state.update_data(had_bad_photo=True) # Статистика плохих фото
+        os.remove(temp_name) 
+        await state.update_data(had_bad_photo=True) 
         await message.answer(
             "❌ <b>Ой, на фото больше одного человека!</b>\n\n"
             "Нейросеть запутается, кого именно из вас рисовать. Пожалуйста, пришлите фото, где ваш герой находится в кадре один."
@@ -659,11 +656,9 @@ async def pet_caption(message: types.Message, state: FSMContext):
 async def toy_photo(message: types.Message, state: FSMContext):
     if message.media_group_id:
         data = await state.get_data()
-        # Если мы уже ругались на этот альбом, просто молча игнорируем остальные фотки
         if data.get("last_error_group") == message.media_group_id:
             return 
         
-        # Запоминаем ID этого альбома и выдаем ошибку ОДИН раз
         await state.update_data(last_error_group=message.media_group_id)
         await message.answer("❌ <b>Пожалуйста, присылайте строго по ОДНОМУ фото за раз!</b>\nЯ не умею обрабатывать альбомы. Выберите одно лучшее фото и отправьте его.")
         return
@@ -676,6 +671,7 @@ async def toy_photo(message: types.Message, state: FSMContext):
     await message.reply("🧸 <b>Вижу!</b> Как называется игрушка?", reply_markup=ReplyKeyboardRemove())
     await state.set_state(OrderFlow.waiting_for_toy_caption)
 
+
 @dp.message(OrderFlow.waiting_for_toy_caption, F.text, ~F.text.startswith('/'))
 async def toy_caption(message: types.Message, state: FSMContext):
     name = clean_filename(message.text)
@@ -687,14 +683,13 @@ async def toy_caption(message: types.Message, state: FSMContext):
     try:
         await asyncio.to_thread(upload_file_to_drive, data['temp_photo_path'], filename, data['current_folder_id'])
         if os.path.exists(data['temp_photo_path']): os.remove(data['temp_photo_path'])  # noqa: E701
-        await finish_all(message, state)
+        await show_agreement(message, state) 
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
 # ================= КАПКАНЫ ДЛЯ ОШИБОК =================
 # Эти хендлеры сработают ТОЛЬКО если пользователь прислал не тот тип данных
 
-# 1. Если ждем ТЕКСТ (имя, контакты, стиль, подписи), а прислали фото, кружок или стикер
 @dp.message(OrderFlow.waiting_for_name, ~F.text)
 @dp.message(OrderFlow.waiting_for_contact, ~F.text)
 @dp.message(OrderFlow.waiting_for_style, ~F.text)
@@ -704,8 +699,13 @@ async def toy_caption(message: types.Message, state: FSMContext):
 async def catch_not_text(message: types.Message):
     await message.answer("⚠️ <b>Пожалуйста, напишите ответ текстом!</b>\nЯ сейчас жду от вас текстовое сообщение, а не картинку или стикер.")
 
-# 2. Если ждем ФОТО, а прислали текст или что-то другое
-ALL_DONE_TEXTS = ["✅ Все люди загружены", "➡️ Нет животных / Готово", "➡️ Готово, идем к игрушкам", "➡️ Нет игрушки / Закончить"]
+ALL_DONE_TEXTS = [
+    "✅ Все люди загружены", 
+    "➡️ Нет животных / Готово", 
+    "➡️ Готово, идем к игрушкам", 
+    "➡️ Нет игрушки / Далее", 
+    "✅ Я соглашаюсь / Завершить заказ"
+]
 
 @dp.message(OrderFlow.waiting_for_relative_photo, ~F.photo, ~F.text.in_(ALL_DONE_TEXTS))
 @dp.message(OrderFlow.waiting_for_pet_photo, ~F.photo, ~F.text.in_(ALL_DONE_TEXTS))
@@ -716,7 +716,26 @@ async def catch_not_photo(message: types.Message):
         "Пожалуйста, прикрепите изображение как обычное фото. "
         "Если вы хотите пропустить этот шаг — нажмите соответствующую кнопку внизу экрана."
     )
-# =======================================================
+    
+async def show_agreement(message: types.Message, state: FSMContext):
+    await message.answer(
+        "❗️ <b>Финальный шаг: Пользовательское соглашение</b> ❗️\n\n"
+        "Перед тем как мы передадим материалы художникам, пожалуйста, подтвердите несколько важных моментов:\n\n"
+        "✅ <b>Внешность и одежда:</b> Я понимаю, что образы героев переносятся с фотографий максимально точно. Одежда на иллюстрациях будет совпадать с той, что на присланных мной фото <i>(исключение: если герой на фото в теплой куртке/пальто, мы бережно адаптируем его наряд под сказочный сюжет)</i>.\n"
+        "✅ <b>Цвет глаз:</b> Я проверил(а) и подтверждаю, что цвет глаз всех героев указан абсолютно верно.\n"
+        "✅ <b>Качество:</b> Я тщательно отобрал(а) фотографии и уверен(а) в своем выборе.\n\n"
+        "Если вы со всем согласны, нажмите кнопку ниже, чтобы завершить заказ и отправить материалы в работу!",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="✅ Я соглашаюсь / Завершить заказ")]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+    )
+    await state.set_state(OrderFlow.waiting_for_agreement)
+    
+@dp.message(OrderFlow.waiting_for_agreement, F.text == "✅ Я соглашаюсь / Завершить заказ")
+async def final_agreement_accept(message: types.Message, state: FSMContext):
+    await finish_all(message, state)
 
 # --- АДМИНСКИЕ КОМАНДЫ ---
 
