@@ -27,11 +27,28 @@ import time
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from sqlite_storage import SQLiteStorage
+from core import (
+    calc_complexity,
+    calc_cost,
+    clean_filename,
+    min_age_from_text,
+    parse_customer_and_child,
+    safe_counts,
+)
+
 # --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ДЛЯ СТАТИСТИКИ ---
 
-DB_DIR = "/app/data" 
+# Путь к данным берём из окружения: в Docker это примонтированный том,
+# локально — папка ./data рядом с кодом. Раньше был жёстко зашит /app/data,
+# из-за чего вне контейнера бот падал при старте.
+DB_DIR = os.getenv("DATA_DIR", "/app/data" if os.path.isdir("/app") else "./data")
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "stats.db")
+FSM_DB_PATH = os.path.join(DB_DIR, "fsm.db")
+# Временные файлы фото — тоже в data-каталог, чтобы не мусорить рядом с кодом
+TEMP_DIR = os.path.join(DB_DIR, "tmp")
+os.makedirs(TEMP_DIR, exist_ok=True)
 
 def init_db():
     # Заменяем "stats.db" на переменную DB_PATH
@@ -63,8 +80,6 @@ load_dotenv()
 # --- КОНФИГУРАЦИЯ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MAIN_FOLDER_ID = os.getenv("MAIN_FOLDER_ID")
-CLIENT_SECRET_FILE = 'credentials.json' 
-#SCOPES = ['https://www.googleapis.com/auth/drive']
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -86,36 +101,72 @@ def get_skip_keyboard(yes_text="📸 Загрузить фото", no_text="➡�
     )
 
 # --- GOOGLE DRIVE AUTH ---
-CLIENT_SECRET_FILE = 'credentials.json'
-# Добавили права на таблицы
 SCOPES = [
     'https://www.googleapis.com/auth/drive',
     'https://www.googleapis.com/auth/spreadsheets'
 ]
 
+# Пути к файлам Google-авторизации: держим их в DATA_DIR (том), а не рядом с кодом,
+# иначе обновлённый токен теряется при каждом перезапуске контейнера.
+CLIENT_SECRET_FILE = os.getenv("GOOGLE_CREDENTIALS_PATH", os.path.join(DB_DIR, "credentials.json"))
+TOKEN_FILE = os.getenv("GOOGLE_TOKEN_PATH", os.path.join(DB_DIR, "token.json"))
+# Разрешать ли интерактивную авторизацию в браузере (только для локального запуска).
+ALLOW_INTERACTIVE_AUTH = os.getenv("ALLOW_INTERACTIVE_AUTH", "false").lower() in ("1", "true", "yes")
+
+_google_services = None
+
+
 def get_google_services():
+    """Возвращает (drive, sheets). Авторизация ленивая и кэшируется.
+
+    Важно: на сервере НЕ пытаемся открыть браузер (run_local_server) — это
+    зависало бы навсегда внутри контейнера. Вместо этого понятная ошибка.
+    """
+    global _google_services
+    if _google_services is not None:
+        return _google_services
+
     creds = None
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if os.path.exists(TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-        else:
+        elif ALLOW_INTERACTIVE_AUTH:
             flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
-            
-    drive = build('drive', 'v3', credentials=creds)
-    sheets = build('sheets', 'v4', credentials=creds)
-    return drive, sheets
+        else:
+            raise RuntimeError(
+                f"Нет валидного Google-токена ({TOKEN_FILE}). "
+                "Авторизуйтесь локально с ALLOW_INTERACTIVE_AUTH=true и положите "
+                "полученный token.json в DATA_DIR на сервере."
+            )
+        try:
+            with open(TOKEN_FILE, "w") as token:
+                token.write(creds.to_json())
+        except OSError as e:
+            logging.warning("Не удалось сохранить обновлённый токен в %s: %s", TOKEN_FILE, e)
 
-drive_service, sheets_service = get_google_services()
+    drive = build("drive", "v3", credentials=creds)
+    sheets = build("sheets", "v4", credentials=creds)
+    _google_services = (drive, sheets)
+    return _google_services
+
+
+def get_drive():
+    return get_google_services()[0]
+
+
+def get_sheets():
+    return get_google_services()[1]
 
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
-dp = Dispatcher()
+# Состояние анкет храним в SQLite, а не в памяти: иначе перезапуск бота
+# (в том числе любой деплой) обнулял бы все незаконченные анкеты клиентов.
+dp = Dispatcher(storage=SQLiteStorage(FSM_DB_PATH))
 logging.basicConfig(level=logging.INFO)
 
 class OrderFlow(StatesGroup):
@@ -146,7 +197,7 @@ def create_drive_folder(folder_name, parent_id):
         'mimeType': 'application/vnd.google-apps.folder',
         'parents': [parent_id]
     }
-    file = drive_service.files().create(body=file_metadata, fields='id, webViewLink').execute()
+    file = get_drive().files().create(body=file_metadata, fields='id, webViewLink').execute()
     return file.get('id'), file.get('webViewLink')
 
 def get_onboarding_keyboard():
@@ -171,18 +222,49 @@ def get_start_after_help_keyboard():
 def upload_file_to_drive(file_path, file_name, parent_id):
     file_metadata = {'name': file_name, 'parents': [parent_id]}
     media = MediaFileUpload(file_path, resumable=True)
-    file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+    file = get_drive().files().create(body=file_metadata, media_body=media, fields='id').execute()
     return file.get('id')
 
 
 
-def clean_filename(text):
-    return re.sub(r'[\\/*?:"<>|]', "", text)
+def _cleanup_temp(path):
+    """Безопасно удаляет временный файл фото (если он есть)."""
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as e:
+        logging.warning("Не удалось удалить временный файл %s: %s", path, e)
+
+
+def cleanup_stale_temp_files(max_age_hours: int = 24) -> int:
+    """Удаляет старые temp-фото.
+
+    Клиент мог прислать фото и не написать подпись (бросил анкету) — раньше
+    такие файлы оставались на диске навсегда.
+    """
+    removed = 0
+    cutoff = time.time() - max_age_hours * 3600
+    try:
+        for name in os.listdir(TEMP_DIR):
+            path = os.path.join(TEMP_DIR, name)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    removed += 1
+            except OSError:
+                continue
+    except OSError as e:
+        logging.warning("Не удалось почистить %s: %s", TEMP_DIR, e)
+    if removed:
+        logging.info("Удалено старых временных файлов: %s", removed)
+    return removed
 
 def append_to_sheet(row_data):
     try:
         body = {'values': [row_data]}
-        sheets_service.spreadsheets().values().append(
+        get_sheets().spreadsheets().values().append(
             spreadsheetId=os.getenv("SPREADSHEET_ID"),
             range="A:G", 
             valueInputOption="USER_ENTERED",
@@ -199,9 +281,7 @@ async def analyze_photo_quality(file_path: str) -> dict:
     """Анализирует фото через Gemini и возвращает JSON с результатами проверки."""
     try:
         model = genai.GenerativeModel('gemini-2.5-flash')
-        
-        sample_file = genai.upload_file(path=file_path)
-        
+
         prompt = """
         You are a strict photo moderator for an automated system.
         Analyze the attached photo and return the result STRICTLY as a JSON object without any markdown formatting.
@@ -214,22 +294,33 @@ async def analyze_photo_quality(file_path: str) -> dict:
         Return the JSON strictly following this template:
         {
         "face_count": <integer, number of people in the photo>,
-        is_naked_or_diaper": <true if wearing only a diaper/underwear/swimsuit or naked, otherwise false>,
+        "is_naked_or_diaper": <true if wearing only a diaper/underwear/swimsuit or naked, otherwise false>,
         "is_full_face_visible": <true if the face is normally visible, false if it's an extreme macro shot or heavily cropped>
         }
         """
-        
-        response = await asyncio.to_thread(model.generate_content, [sample_file, prompt])
-        
-        genai.delete_file(sample_file.name)
-        
+
+        sample_file = None
+        try:
+            sample_file = await asyncio.to_thread(genai.upload_file, file_path)
+            response = await asyncio.to_thread(model.generate_content, [sample_file, prompt])
+        finally:
+            # Удаляем загруженный файл в любом случае, иначе он остаётся
+            # висеть в хранилище Gemini при ошибке генерации.
+            if sample_file is not None:
+                try:
+                    await asyncio.to_thread(genai.delete_file, sample_file.name)
+                except Exception as cleanup_error:
+                    logging.warning("Не удалось удалить файл из Gemini: %s", cleanup_error)
+
         clean_json = response.text.strip().removeprefix('```json').removesuffix('```').strip()
         result = json.loads(clean_json)
         return result
 
     except Exception as e:
         logging.error(f"Ошибка анализа Gemini: {e}")
-        return {"is_naked_or_diaper": False, "eyes_visible": True, "face_count": 1}
+        # Ключи должны совпадать с теми, что проверяет вызывающий код,
+        # иначе при сбое ИИ проверки молча пропускают любое фото.
+        return {"face_count": 1, "is_naked_or_diaper": False, "is_full_face_visible": True}
 
 # ================= ХЕНДЛЕРЫ =================
 
@@ -534,7 +625,7 @@ async def relative_photo(message: types.Message, state: FSMContext):
         return
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
-    temp_name = f"temp_{photo.file_id[:10]}.jpg"
+    temp_name = os.path.join(TEMP_DIR, f"temp_{photo.file_id[:10]}.jpg")
     await bot.download_file(file.file_path, temp_name)
     
     msg_thinking = await message.reply("👀 <i>Внимательно смотрю на фотографию...</i>")
@@ -576,7 +667,7 @@ async def relative_photo(message: types.Message, state: FSMContext):
     await state.update_data(temp_photo_path=temp_name)
     await message.reply(
         "📸 <b>Фото прошло проверку и принято!</b>\n"
-        "Напишити пожалуйста: <b>Кто это?</b> (например: Мама Оля, Дедушка Валера, Тетя Полина и т.д.)", 
+        "Напишите, пожалуйста: <b>Кто это?</b> (например: Мама Оля, Дедушка Валера, Тетя Полина и т.д.)", 
         reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(OrderFlow.waiting_for_relative_caption)
@@ -602,6 +693,7 @@ async def relative_caption(message: types.Message, state: FSMContext):
         )
         await state.set_state(OrderFlow.waiting_for_relative_photo)
     except Exception as e:
+        _cleanup_temp(data.get('temp_photo_path'))
         await message.answer(f"❌ Ошибка: {e}")
 
 # --- БЛОК ПИТОМЦЕВ ---
@@ -620,7 +712,7 @@ async def pet_photo(message: types.Message, state: FSMContext):
         return
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
-    temp_name = f"temp_pet_{photo.file_id[:10]}.jpg"
+    temp_name = os.path.join(TEMP_DIR, f"temp_pet_{photo.file_id[:10]}.jpg")
     await bot.download_file(file.file_path, temp_name)
     await state.update_data(temp_photo_path=temp_name)
 
@@ -647,6 +739,7 @@ async def pet_caption(message: types.Message, state: FSMContext):
         )
         await state.set_state(OrderFlow.waiting_for_pet_photo)
     except Exception as e:
+        _cleanup_temp(data.get('temp_photo_path'))
         await message.answer(f"❌ Ошибка: {e}")
 
 # --- БЛОК ИГРУШКИ ---
@@ -664,7 +757,7 @@ async def toy_photo(message: types.Message, state: FSMContext):
         return
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
-    temp_name = f"temp_toy_{photo.file_id[:10]}.jpg"
+    temp_name = os.path.join(TEMP_DIR, f"temp_toy_{photo.file_id[:10]}.jpg")
     await bot.download_file(file.file_path, temp_name)
     await state.update_data(temp_photo_path=temp_name)
 
@@ -685,6 +778,7 @@ async def toy_caption(message: types.Message, state: FSMContext):
         if os.path.exists(data['temp_photo_path']): os.remove(data['temp_photo_path'])  # noqa: E701
         await show_agreement(message, state) 
     except Exception as e:
+        _cleanup_temp(data.get('temp_photo_path'))
         await message.answer(f"❌ Ошибка: {e}")
 
 # ================= КАПКАНЫ ДЛЯ ОШИБОК =================
@@ -746,50 +840,17 @@ async def finish_all(message: types.Message, state: FSMContext):
     style = data.get('book_style', 'Не указан')
     
     age_str = data.get('main_chars_age', '0')
-    try:
-        ages = [int(x) for x in re.findall(r'\d+', age_str)]
-        min_age = min(ages) if ages else 0 
-        
-        main_count = int(data.get('main_chars_count', 1))
-        total_count = int(data.get('total_chars_count', 1))
-    except ValueError:
-        min_age, main_count, total_count = 0, 1, 1
+    min_age = min_age_from_text(age_str)
+    main_count, total_count = safe_counts(
+        data.get('main_chars_count', 1), data.get('total_chars_count', 1)
+    )
 
-    
-    match = re.search(r"^(.*?)\s*\((.*?)\)\s*(.*)$", full_name_str)
-    if match:
-        customer_name = f"{match.group(1).strip()} {match.group(3).strip()}" # Иванов Иван @nik
-        child_name = match.group(2).strip() # Миша
-    else:
-        customer_name = full_name_str
-        child_name = "Не указано"
+    customer_name, child_name = parse_customer_and_child(full_name_str)
 
-    # 3. МАТЕМАТИКА: Сложность заказа
-    complexity = 0
-    complexity += 2 if min_age <= 3 else 3
-    complexity += 1 if main_count == 1 else 3
-    
-    if total_count <= 7:
-        complexity += 2
-    elif 8 <= total_count <= 12:
-        complexity += 3
-    else:
-        complexity += 4
-        
-    complexity_str = f"{complexity} ⭐"
-
-    # 4. МАТЕМАТИКА: Стоимость книги
-    base_cost = 60 if total_count > 7 else 50
-    
-    if main_count > 1:
-        cost = base_cost + ((main_count - 1) * (base_cost * 0.5))
-    else:
-        cost = base_cost
-        
-    if total_count > 12:
-        cost += 20
-        
-    cost_str = f"{int(cost)} BYN"
+    # 3-4. Сложность и стоимость (правила и тесты — в core.py)
+    complexity_str = f"{calc_complexity(min_age, main_count, total_count)} ⭐"
+    cost = calc_cost(main_count, total_count)
+    cost_str = f"{cost} BYN"
 
     # 5. ОТПРАВЛЯЕМ ДАННЫЕ В ТАБЛИЦУ
     row_data = [customer_name, child_name, total_count, complexity_str, cost_str, style, age_str]
@@ -945,10 +1006,15 @@ async def send_monthly_stats():
             logging.error(f"Ошибка отправки статистики: {e}")
 
 async def main():
+    # Чистим временные файлы, оставшиеся от брошенных анкет
+    cleanup_stale_temp_files()
+
     # Настраиваем планировщик
     scheduler = AsyncIOScheduler()
     # Запускаем 2-го числа каждого месяца в 12:00 дня
     scheduler.add_job(send_monthly_stats, 'cron', day=2, hour=12, minute=0)
+    # Ежедневная уборка временных файлов
+    scheduler.add_job(cleanup_stale_temp_files, 'cron', hour=4, minute=0)
     scheduler.start()
 
     await dp.start_polling(bot)

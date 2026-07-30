@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    restart: always
+    env_file: .env
+    environment:
+      DATA_DIR: /app/data
+    volumes:
+      # Здесь лежат: stats.db, fsm.db (состояние анкет), credentials.json,
+      # token.json и временные фото. Том обязателен — иначе при обновлении
+      # теряются незаконченные анкеты клиентов и Google-авторизация.
+      - bot_data:/app/data
+
+volumes:
+  bot_data:

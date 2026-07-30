@@ -1,2 +1,15 @@
+# --- Секреты: НИКОГДА не коммитить ---
 .env
-stats.db
+credentials.json
+token.json
+
+# Данные (БД статистики, состояние анкет, временные фото, Google-креды)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
