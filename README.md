@@ -7,7 +7,9 @@ Telegram-бот: собирает бриф на книгу (герои, стил
 
 ## Стек
 
-Python 3.12 · aiogram 3 · Google Drive/Sheets API · Gemini · SQLite · APScheduler
+Python 3.12 · aiogram 3 · Google Drive/Sheets API · Gemini (`google-genai`) · SQLite · APScheduler
+
+Модель Gemini задаётся переменной `GEMINI_MODEL` (по умолчанию `gemini-2.5-flash`).
 
 ## Структура
 

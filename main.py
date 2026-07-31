@@ -19,7 +19,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-import google.generativeai as genai
+from google import genai
 import json
 
 import sqlite3
@@ -227,6 +227,26 @@ def upload_file_to_drive(file_path, file_name, parent_id):
 
 
 
+async def claim_album_photo(state: FSMContext, media_group_id: str) -> bool:
+    """Берём из альбома только первое фото.
+
+    Раньше альбом отвергался целиком и клиенту приходилось пересылать фото
+    заново. Теперь первое фото обрабатывается как обычно, остальные тихо
+    игнорируются — переделывать ничего не нужно.
+    """
+    data = await state.get_data()
+    if data.get("handled_album") == media_group_id:
+        return False
+    await state.update_data(handled_album=media_group_id)
+    return True
+
+
+ALBUM_NOTICE = (
+    "📸 Вы прислали альбом — беру <b>первое</b> фото, остальные пропускаю.\n"
+    "Нужно другое? Пришлите его отдельным сообщением 🙂"
+)
+
+
 def _cleanup_temp(path):
     """Безопасно удаляет временный файл фото (если он есть)."""
     if not path:
@@ -274,13 +294,24 @@ def append_to_sheet(row_data):
         logging.error(f"Ошибка записи в Google Таблицу: {e}")
         
         
-genai.configure(api_key=GEMINI_API_KEY)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# --- ФУНКИЯ АНАЛИЗА ФОТО (Gemini) ---
+_gemini_client = None
+
+
+def get_gemini():
+    """Клиент Gemini (новый SDK google-genai). Создаётся лениво."""
+    global _gemini_client
+    if _gemini_client is None:
+        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    return _gemini_client
+
+
+# --- ФУНКЦИЯ АНАЛИЗА ФОТО (Gemini) ---
 async def analyze_photo_quality(file_path: str) -> dict:
-    """Анализирует фото через Gemini и возвращает JSON с результатами проверки."""
+    """Анализирует фото через Gemini и возвращает результат проверки."""
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        client = get_gemini()
 
         prompt = """
         You are a strict photo moderator for an automated system.
@@ -301,14 +332,18 @@ async def analyze_photo_quality(file_path: str) -> dict:
 
         sample_file = None
         try:
-            sample_file = await asyncio.to_thread(genai.upload_file, file_path)
-            response = await asyncio.to_thread(model.generate_content, [sample_file, prompt])
+            sample_file = await asyncio.to_thread(lambda: client.files.upload(file=file_path))
+            response = await asyncio.to_thread(
+                lambda: client.models.generate_content(
+                    model=GEMINI_MODEL, contents=[sample_file, prompt]
+                )
+            )
         finally:
             # Удаляем загруженный файл в любом случае, иначе он остаётся
             # висеть в хранилище Gemini при ошибке генерации.
             if sample_file is not None:
                 try:
-                    await asyncio.to_thread(genai.delete_file, sample_file.name)
+                    await asyncio.to_thread(lambda: client.files.delete(name=sample_file.name))
                 except Exception as cleanup_error:
                     logging.warning("Не удалось удалить файл из Gemini: %s", cleanup_error)
 
@@ -615,14 +650,9 @@ async def skip_toy_and_agreement(message: types.Message, state: FSMContext):
 @dp.message(OrderFlow.waiting_for_relative_photo, F.photo)
 async def relative_photo(message: types.Message, state: FSMContext):
     if message.media_group_id:
-        data = await state.get_data()
-
-        if data.get("last_error_group") == message.media_group_id:
-            return 
-    
-        await state.update_data(last_error_group=message.media_group_id)
-        await message.answer("❌ <b>Пожалуйста, присылайте строго по ОДНОМУ фото за раз!</b>\nЯ не умею обрабатывать альбомы. Выберите одно лучшее фото и отправьте его.")
-        return
+        if not await claim_album_photo(state, message.media_group_id):
+            return
+        await message.answer(ALBUM_NOTICE)
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     temp_name = os.path.join(TEMP_DIR, f"temp_{photo.file_id[:10]}.jpg")
@@ -701,15 +731,9 @@ async def relative_caption(message: types.Message, state: FSMContext):
 @dp.message(OrderFlow.waiting_for_pet_photo, F.photo)
 async def pet_photo(message: types.Message, state: FSMContext):
     if message.media_group_id:
-        data = await state.get_data()
-        # Если мы уже ругались на этот альбом, просто молча игнорируем остальные фотки
-        if data.get("last_error_group") == message.media_group_id:
-            return 
-        
-        # Запоминаем ID этого альбома и выдаем ошибку ОДИН раз
-        await state.update_data(last_error_group=message.media_group_id)
-        await message.answer("❌ <b>Пожалуйста, присылайте строго по ОДНОМУ фото за раз!</b>\nЯ не умею обрабатывать альбомы. Выберите одно лучшее фото и отправьте его.")
-        return
+        if not await claim_album_photo(state, message.media_group_id):
+            return
+        await message.answer(ALBUM_NOTICE)
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     temp_name = os.path.join(TEMP_DIR, f"temp_pet_{photo.file_id[:10]}.jpg")
@@ -748,13 +772,9 @@ async def pet_caption(message: types.Message, state: FSMContext):
 @dp.message(OrderFlow.waiting_for_toy_photo, F.photo)
 async def toy_photo(message: types.Message, state: FSMContext):
     if message.media_group_id:
-        data = await state.get_data()
-        if data.get("last_error_group") == message.media_group_id:
-            return 
-        
-        await state.update_data(last_error_group=message.media_group_id)
-        await message.answer("❌ <b>Пожалуйста, присылайте строго по ОДНОМУ фото за раз!</b>\nЯ не умею обрабатывать альбомы. Выберите одно лучшее фото и отправьте его.")
-        return
+        if not await claim_album_photo(state, message.media_group_id):
+            return
+        await message.answer(ALBUM_NOTICE)
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     temp_name = os.path.join(TEMP_DIR, f"temp_toy_{photo.file_id[:10]}.jpg")
@@ -923,6 +943,23 @@ async def cmd_manual(message: types.Message, command: CommandObject, state: FSMC
 
     folder_name = command.args.strip()
 
+    # 2.5 Не затираем молча текущую работу: у админа одно состояние на аккаунт,
+    # поэтому предупреждаем, если он уже что-то заполняет.
+    data = await state.get_data()
+    current_state = await state.get_state()
+    if data.get("manual_mode"):
+        await message.answer(
+            f"⚠️ Уже открыт ручной заказ: <b>{data.get('manual_order_name', '—')}</b>\n"
+            "Завершите его — /manual_done — и создайте следующий."
+        )
+        return
+    if current_state is not None:
+        await message.answer(
+            "⚠️ Вы сейчас в середине анкеты. Сбросьте её — /restart — "
+            "и потом создавайте ручной заказ."
+        )
+        return
+
     # 3. Сразу создаем папку
     msg = await message.answer(f"🛠 <b>Ручной режим:</b> Создаю папку '<b>{folder_name}</b>'... ⏳")
 
@@ -930,18 +967,22 @@ async def cmd_manual(message: types.Message, command: CommandObject, state: FSMC
         # Создаем папку на Диске
         folder_id, folder_link = await asyncio.to_thread(create_drive_folder, folder_name, MAIN_FOLDER_ID)
 
-        # Сохраняем данные в состояние, как будто клиент сам все прошел
+        # Помечаем ручной режим: так видно, в какой заказ уходят фото,
+        # и можно отличить его от собственной анкеты админа.
         await state.update_data(
             current_folder_id=folder_id,
             folder_link=folder_link,
-            full_name=folder_name
+            full_name=folder_name,
+            manual_mode=True,
+            manual_order_name=folder_name,
         )
 
         await msg.edit_text(
             f"📂 <b>Папка готова!</b>\n"
             f"🔗 <a href='{folder_link}'>Ссылка</a>\n\n"
-            "👇 <b>Теперь пересылай фото от менеджера.</b>\n"
-            "Пересылай ПО ОДНОМУ, подписывай как обычно."
+            f"🛠 Ручной режим: <b>{folder_name}</b>\n"
+            "👇 Пересылай фото ПО ОДНОМУ и подписывай как обычно.\n"
+            "Закончишь — /manual_done"
         )
 
         # Сразу ставим состояние ожидания фото родственника
@@ -952,6 +993,28 @@ async def cmd_manual(message: types.Message, command: CommandObject, state: FSMC
 
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
+
+
+@dp.message(Command("manual_done"))
+async def cmd_manual_done(message: types.Message, state: FSMContext):
+    """Выход из ручного режима: освобождает состояние админа."""
+    if message.from_user.id not in (ADMIN_ID if isinstance(ADMIN_ID, list) else [ADMIN_ID]):
+        return
+
+    data = await state.get_data()
+    if not data.get("manual_mode"):
+        await message.answer("Сейчас ручной режим не активен.")
+        return
+
+    name = data.get("manual_order_name", "заказ")
+    link = data.get("folder_link")
+    await state.clear()
+    await message.answer(
+        f"✅ Ручной режим завершён: <b>{name}</b>\n"
+        + (f"🔗 <a href='{link}'>Папка на Диске</a>" if link else ""),
+        reply_markup=ReplyKeyboardRemove(),
+        disable_web_page_preview=True,
+    )
     
     
 async def send_monthly_stats():
